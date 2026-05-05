@@ -103,6 +103,118 @@ public:
 	}
 };
 
+#pragma pack(push, 1)
+struct DbiStreamHeader
+{
+	int32_t  VersionSignature;
+	uint32_t VersionHeader;
+	uint32_t Age;
+	uint16_t GlobalSymbolStreamIndex;
+	uint16_t BuildNumber;
+	uint16_t PublicSymbolStreamIndex;
+	uint16_t PdbDllVersion;
+	uint16_t SymRecordStreamIndex;
+	uint16_t PdbDllRbld;
+	int32_t  ModInfoSize;
+	int32_t  SectionContributionSize;
+	int32_t  SectionMapSize;
+	int32_t  SourceInfoSize;
+	int32_t  TypeServerMapSize;
+	uint32_t MfcTypeServerIndex;
+	int32_t  OptionalDbgHeaderSize;
+	int32_t  ECSubstreamSize;
+	uint16_t Flags;
+	uint16_t Machine;
+	uint32_t Padding;
+};
+#pragma pack(pop)
+static_assert(sizeof(DbiStreamHeader) == 64, "DbiStreamHeader must be 64 bytes");
+
+// Emits a DBI stream that consumers can parse cleanly but which describes no
+// modules, no section contributions, no section map entries, and no source
+// files.  Future commits will add real content via methods that mirror the
+// cv2pdb::PdbWriter / ModWriter calls (addSec, openMod, addSecContrib, ...).
+//
+// All sub-streams that the LLVM reader requires to be sized non-zero carry
+// just enough header bytes to make sense:
+//   - Section Contributions: 4 bytes for the V60 version magic.
+//   - Section Map: 4 bytes for SectionMapHeader{Count=0, LogCount=0}.
+//   - Source Info: 4 bytes for {NumModules=0, NumSourceFiles=0}.
+//   - Optional Debug Header: 22 bytes, eleven kInvalidStreamIndex entries.
+// ModInfo, TypeServerMap, and ECSubstream stay 0-sized; LLVM tolerates that.
+class DbiStreamBuilder
+{
+public:
+	std::vector<uint8_t> buildStream(uint16_t machine) const
+	{
+		// Substream payloads, in the order the DBI stream layout requires:
+		// ModInfo, SecContrib, SecMap, SourceInfo, TypeServerMap, EC,
+		// OptionalDbgHeader.
+		std::vector<uint8_t> modInfo;        // empty: no modules
+
+		std::vector<uint8_t> secContrib;
+		appendU32LE(secContrib, 0xF12EBA2D); // DbiSecContribVer60
+
+		std::vector<uint8_t> secMap;
+		// SectionMapHeader { Count, LogCount }
+		secMap.push_back(0); secMap.push_back(0);   // Count = 0
+		secMap.push_back(0); secMap.push_back(0);   // LogCount = 0
+
+		std::vector<uint8_t> sourceInfo;
+		// uint16_t NumModules = 0, uint16_t NumSourceFiles = 0
+		sourceInfo.push_back(0); sourceInfo.push_back(0);
+		sourceInfo.push_back(0); sourceInfo.push_back(0);
+
+		std::vector<uint8_t> typeServerMap;  // empty
+		std::vector<uint8_t> ecSubstream;    // empty
+
+		std::vector<uint8_t> optDbgHdr;
+		for (int i = 0; i < 11; i++)
+		{
+			optDbgHdr.push_back(0xFF);
+			optDbgHdr.push_back(0xFF);
+		}
+
+		DbiStreamHeader hdr = {};
+		hdr.VersionSignature        = -1;
+		hdr.VersionHeader           = 19990903;     // V70
+		hdr.Age                     = 1;
+		hdr.GlobalSymbolStreamIndex = 0xFFFF;
+		hdr.BuildNumber             = 0x8E0B;       // 36363, lld-link's value
+		hdr.PublicSymbolStreamIndex = 0xFFFF;
+		hdr.PdbDllVersion           = 0;
+		hdr.SymRecordStreamIndex    = 0xFFFF;
+		hdr.PdbDllRbld              = 0;
+		hdr.ModInfoSize             = static_cast<int32_t>(modInfo.size());
+		hdr.SectionContributionSize = static_cast<int32_t>(secContrib.size());
+		hdr.SectionMapSize          = static_cast<int32_t>(secMap.size());
+		hdr.SourceInfoSize          = static_cast<int32_t>(sourceInfo.size());
+		hdr.TypeServerMapSize       = static_cast<int32_t>(typeServerMap.size());
+		hdr.MfcTypeServerIndex      = 0xFFFFFFFF;
+		hdr.OptionalDbgHeaderSize   = static_cast<int32_t>(optDbgHdr.size());
+		hdr.ECSubstreamSize         = static_cast<int32_t>(ecSubstream.size());
+		hdr.Flags                   = 0;
+		hdr.Machine                 = machine;
+		hdr.Padding                 = 0;
+
+		std::vector<uint8_t> blob;
+		blob.reserve(sizeof(hdr) + modInfo.size() + secContrib.size()
+		             + secMap.size() + sourceInfo.size()
+		             + typeServerMap.size() + ecSubstream.size()
+		             + optDbgHdr.size());
+		const uint8_t* hdrBytes = reinterpret_cast<const uint8_t*>(&hdr);
+		blob.insert(blob.end(), hdrBytes, hdrBytes + sizeof(hdr));
+		blob.insert(blob.end(), modInfo.begin(), modInfo.end());
+		blob.insert(blob.end(), secContrib.begin(), secContrib.end());
+		blob.insert(blob.end(), secMap.begin(), secMap.end());
+		blob.insert(blob.end(), sourceInfo.begin(), sourceInfo.end());
+		blob.insert(blob.end(), typeServerMap.begin(), typeServerMap.end());
+		blob.insert(blob.end(), ecSubstream.begin(), ecSubstream.end());
+		blob.insert(blob.end(), optDbgHdr.begin(), optDbgHdr.end());
+		return blob;
+	}
+};
+
 class NativeModWriter : public ModWriter
 {
 public:
@@ -180,6 +292,7 @@ public:
 
 		TpiStreamBuilder tpi;
 		TpiStreamBuilder ipi;
+		DbiStreamBuilder dbi;
 
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
@@ -218,7 +331,7 @@ public:
 		const uint16_t kIpiHashIndex = 6;
 
 		msf.addStream(tpi.buildStream(kTpiHashIndex));   // 2: TPI
-		msf.addStream({});                               // 3: DBI placeholder
+		msf.addStream(dbi.buildStream(machine_));        // 3: DBI
 		msf.addStream(ipi.buildStream(kIpiHashIndex));   // 4: IPI
 		msf.addStream(tpi.buildHashStream());            // 5: TPI hash
 		msf.addStream(ipi.buildHashStream());            // 6: IPI hash
