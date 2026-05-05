@@ -138,16 +138,21 @@ bool CV2PDB::openPDB(const TCHAR* pdbname, const TCHAR* pdbref)
 	mbstowcs (pdbnameW, pdbname, 260);
 #endif
 
-	if (!initMsPdb ())
-		return setError("cannot load PDB helper DLL");
-	if (debug & DbgBasic)
+	if (!useNativePdbWriter)
 	{
-		extern HMODULE modMsPdb;
-		char modpath[260];
-		GetModuleFileNameA(modMsPdb, modpath, 260);
-		printf("Loaded PDB helper DLL: %s\n", modpath);
+		if (!initMsPdb ())
+			return setError("cannot load PDB helper DLL");
+		if (debug & DbgBasic)
+		{
+			extern HMODULE modMsPdb;
+			char modpath[260];
+			GetModuleFileNameA(modMsPdb, modpath, 260);
+			printf("Loaded PDB helper DLL: %s\n", modpath);
+		}
 	}
-	writer = cv2pdb::createMsPdbWriter(pdbnameW);
+	writer = useNativePdbWriter
+	         ? cv2pdb::createNativePdbWriter(pdbnameW)
+	         : cv2pdb::createMsPdbWriter(pdbnameW);
 	if (!writer)
 		return setError("cannot create PDB file");
 

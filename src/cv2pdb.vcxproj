@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -266,6 +266,8 @@
   <ItemGroup>
     <ClCompile Include="cv2pdb.cpp" />
     <ClCompile Include="CV2PdbWriter.cpp" />
+    <ClCompile Include="MsfBuilder.cpp" />
+    <ClCompile Include="NativePdbWriter.cpp" />
     <ClCompile Include="cvutil.cpp" />
     <ClCompile Include="demangle.cpp" />
     <ClCompile Include="dwarf2pdb.cpp" />
@@ -279,6 +281,7 @@
   <ItemGroup>
     <ClInclude Include="cv2pdb.h" />
     <ClInclude Include="CV2PdbWriter.h" />
+    <ClInclude Include="MsfBuilder.h" />
     <ClInclude Include="cvutil.h" />
     <ClInclude Include="dcvinfo.h" />
     <ClInclude Include="demangle.h" />

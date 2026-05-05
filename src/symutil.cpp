@@ -18,6 +18,7 @@ extern "C" {
 char dotReplacementChar = '@';
 bool demangleSymbols = true;
 bool useTypedefEnum = false;
+bool useNativePdbWriter = false;
 
 int dsym2c(const BYTE* p, int len, char* cname, int maxclen)
 {

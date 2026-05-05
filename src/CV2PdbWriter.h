@@ -96,6 +96,14 @@ public:
 // invoke commit() or close() and then delete the writer.
 PdbWriter* createMsPdbWriter(const wchar_t* pdbname);
 
+// Construct an in-house writer that produces a PDB file directly, with no
+// dependency on the legacy mspdb*.dll runtime.  The returned writer is
+// deliberately incomplete at this stage: it accepts every add* call and
+// discards the data, then on commit() writes a structurally valid but
+// otherwise empty PDB.  Type, symbol, and line tables will be filled in by
+// later commits.  Returns NULL on allocation failure.
+PdbWriter* createNativePdbWriter(const wchar_t* pdbname);
+
 }  // namespace cv2pdb
 
 #endif  // __CV2PDBWRITER_H__

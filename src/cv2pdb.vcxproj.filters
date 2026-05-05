@@ -13,6 +13,12 @@
     <ClCompile Include="CV2PdbWriter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MsfBuilder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="NativePdbWriter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="cvutil.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -46,6 +52,9 @@
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="CV2PdbWriter.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MsfBuilder.h">
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="cvutil.h">

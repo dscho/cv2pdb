@@ -21,6 +21,9 @@ SRC = src\cv2pdb.cpp \
       src\cv2pdb.h \
       src\CV2PdbWriter.cpp \
       src\CV2PdbWriter.h \
+      src\MsfBuilder.cpp \
+      src\MsfBuilder.h \
+      src\NativePdbWriter.cpp \
       src\demangle.cpp \
       src\demangle.h \
       src\dwarf2pdb.cpp \
