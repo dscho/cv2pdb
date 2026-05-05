@@ -1370,18 +1370,18 @@ bool CV2PDB::addDWARFSymbols()
 #endif
 
 	//////////////////////////
-	mspdb::Mod* mod = globalMod();
+	cv2pdb::ModWriter* mod = globalMod();
 	//return writeSymbols (mod, ddata, off, prefix, true);
 	return addSymbols(mod, data, off, true);
 }
 
-bool CV2PDB::addDWARFSectionContrib(mspdb::Mod* mod, unsigned long pclo, unsigned long pchi)
+bool CV2PDB::addDWARFSectionContrib(cv2pdb::ModWriter* mod, unsigned long pclo, unsigned long pchi)
 {
 	int segIndex = imgDbg->findSection(pclo);
 	if(segIndex >= 0)
 	{
 		int segFlags = 0x60101020; // 0x40401040, 0x60500020; // TODO
-		int rc = mod->AddSecContrib(segIndex, pclo, pchi - pclo, segFlags);
+		int rc = mod->addSecContrib(segIndex, pclo, pchi - pclo, segFlags);
 		if (rc <= 0)
 			return setError("cannot add section contribution to module");
 	}
@@ -1794,7 +1794,7 @@ bool CV2PDB::createTypes()
 	img.createSymbolCache();
 	if (&img != imgDbg)
 		imgDbg->createSymbolCache();
-	mspdb::Mod* mod = globalMod();
+	cv2pdb::ModWriter* mod = globalMod();
 	int firstUserType = nextUserType;
 	int typeID = nextUserType;
 	int pointerAttr = img.isX64() ? 0x1000C : 0x800A;
@@ -1920,7 +1920,7 @@ bool CV2PDB::createTypes()
 							if (debug & DbgPdbSyms)
 								fprintf(stderr, "%s:%d: Adding a public: %s at %llx\n", __FUNCTION__, __LINE__, id.name, entry_point);
 
-							mod->AddPublic2(id.name, img.text.secNo + 1, entry_point - codeSegOff, 0);
+							mod->addPublic(id.name, img.text.secNo + 1, entry_point - codeSegOff, 0);
 						}
 
 						// Only add the definition, not declaration, because
@@ -2023,7 +2023,7 @@ bool CV2PDB::createTypes()
 							type = nextDwarfType++;
 						}
 						appendGlobalVar(id.name, type, seg + 1, segOff);
-						int rc = mod->AddPublic2(id.name, seg + 1, segOff, type);
+						int rc = mod->addPublic(id.name, seg + 1, segOff, type);
 					}
 				}
 				break;
@@ -2082,12 +2082,12 @@ bool CV2PDB::createDWARFModules()
 
 	codeSegOff = img.getImageBase() + img.getSection(img.text.secNo).VirtualAddress;
 
-	mspdb::Mod* mod = globalMod();
+	cv2pdb::ModWriter* mod = globalMod();
 	int s = 0;
 	for (; s < img.countSections(); s++)
 	{
 		const IMAGE_SECTION_HEADER& sec = img.getSection(s);
-		int rc = dbi->AddSec(s + 1, 0x10d, 0, sec.Misc.VirtualSize);
+		int rc = writer->addSec(s + 1, 0x10d, 0, sec.Misc.VirtualSize);
 		if (rc <= 0)
 			return setError("cannot add section");
 	}
@@ -2106,7 +2106,7 @@ bool CV2PDB::createDWARFModules()
 
 			// Is 'name' one of the debug sections?
 			if (!strncmp(name, ".debug_", 7)) {
-				int rc = dbi->AddSec(s++, 0x10d, 0, sec.Misc.VirtualSize);
+				int rc = writer->addSec(s++, 0x10d, 0, sec.Misc.VirtualSize);
 				if (rc <= 0)
 					return setError("cannot add section");
 			}
@@ -2120,7 +2120,7 @@ bool CV2PDB::createDWARFModules()
 	s = img.text.secNo;
 	int pclo = 0; // img.getImageBase() + img.getSection(s).VirtualAddress;
 	int pchi = pclo + img.getSection(s).Misc.VirtualSize;
-	int rc = mod->AddSecContrib(s + 1, pclo, pchi - pclo, segFlags);
+	int rc = mod->addSecContrib(s + 1, pclo, pchi - pclo, segFlags);
 	if (rc <= 0)
 		return setError("cannot add section contribution to module");
 #endif
@@ -2157,12 +2157,12 @@ bool CV2PDB::createDWARFModules()
 	*/
 
 #if 0
-	modules = new mspdb::Mod* [countEntries];
+	modules = new cv2pdb::ModWriter* [countEntries];
 	memset (modules, 0, countEntries * sizeof(*modules));
 
 	for (int m = 0; m < countEntries; m++)
 	{
-		mspdb::Mod* mod = globalMod();
+		cv2pdb::ModWriter* mod = globalMod();
 	}
 #endif
 
@@ -2175,7 +2175,7 @@ bool CV2PDB::createDWARFModules()
 			cbUserTypes += cbDwarfTypes;
 			cbDwarfTypes = 0;
 		}
-		int rc = mod->AddTypes(userTypes, cbUserTypes);
+		int rc = mod->addTypes(userTypes, cbUserTypes);
 		if (rc <= 0)
 			return setError("cannot add type info to module");
 	}
@@ -2195,10 +2195,10 @@ bool CV2PDB::addDWARFLines()
 
 bool CV2PDB::addDWARFPublics()
 {
-	mspdb::Mod* mod = globalMod();
+	cv2pdb::ModWriter* mod = globalMod();
 
 	int type = 0;
-	int rc = mod->AddPublic2("public_all", img.text.secNo + 1, 0, BASE_USER_TYPE);
+	int rc = mod->addPublic("public_all", img.text.secNo + 1, 0, BASE_USER_TYPE);
 	if (rc <= 0)
 		return setError("cannot add public");
 	return true;

@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include "mspdb.h"
+#include "CV2PdbWriter.h"
 
 typedef unsigned char byte;
 class PEImage;
@@ -405,7 +406,7 @@ struct DWARF_LineState
 	unsigned long seg_offset;
 	unsigned long section;
 	unsigned long last_addr;
-	std::vector<mspdb::LineInfoEntry> lineInfo;
+	std::vector<cv2pdb::LineInfoEntry> lineInfo;
 	unsigned int lineInfo_file;
 	unsigned int lineInfo_low_line;
 
@@ -620,6 +621,6 @@ public:
 
 // iterate over DWARF debug_line information
 // if mod is null, print them out, otherwise add to module
-bool interpretDWARFLines(const PEImage& img, mspdb::Mod* mod, DebugLevel debug = DebugLevel{});
+bool interpretDWARFLines(const PEImage& img, cv2pdb::ModWriter* mod, DebugLevel debug = DebugLevel{});
 
 #endif

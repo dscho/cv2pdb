@@ -26,11 +26,13 @@ namespace cv2pdb {
 // One CodeView line-number record, as consumed by ModWriter::addLines.
 // Layout matches what mspdb's ModCommon::AddLines expects when an array of
 // these is passed as the pLineInfo blob.
+#pragma pack(push, 1)
 struct LineInfoEntry
 {
 	unsigned int   offset;
 	unsigned short line;
 };
+#pragma pack(pop)
 
 // Per-module writer.  Lifetime is owned by the parent PdbWriter; callers must
 // not delete instances directly.  All methods return a non-zero "true-ish"

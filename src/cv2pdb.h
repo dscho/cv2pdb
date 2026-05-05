@@ -11,6 +11,7 @@
 
 #include "LastError.h"
 #include "mspdb.h"
+#include "CV2PdbWriter.h"
 #include "readDwarf.h"
 
 #include <windows.h>
@@ -150,8 +151,8 @@ public:
 	// returns new destSize
 	int copySymbols(BYTE* srcSymbols, int srcSize, BYTE* destSymbols, int destSize);
 
-	bool writeSymbols(mspdb::Mod* mod, DWORD* data, int databytes, int prefix, bool addGlobals);
-	bool addSymbols(mspdb::Mod* mod, BYTE* symbols, int cb, bool addGlobals);
+	bool writeSymbols(cv2pdb::ModWriter* mod, DWORD* data, int databytes, int prefix, bool addGlobals);
+	bool addSymbols(cv2pdb::ModWriter* mod, BYTE* symbols, int cb, bool addGlobals);
 	bool addSymbols(int iMod, BYTE* symbols, int cb, bool addGlobals);
 	bool addSymbols();
 
@@ -161,7 +162,7 @@ public:
 
 	bool writeImage(const TCHAR* opath, PEImage& exeImage);
 
-	mspdb::Mod* globalMod();
+	cv2pdb::ModWriter* globalMod();
 
 	// DWARF
 	bool createDWARFModules();
@@ -174,7 +175,7 @@ public:
 	// Helper to just print the DWARF tree we've built for debugging purposes.
 	void dumpDwarfTree() const;
 
-	bool addDWARFSectionContrib(mspdb::Mod* mod, unsigned long pclo, unsigned long pchi);
+	bool addDWARFSectionContrib(cv2pdb::ModWriter* mod, unsigned long pclo, unsigned long pchi);
 	bool addDWARFProc(DWARF_InfoData& id, const std::vector<RangeEntry> &ranges, DIECursor cursor);
 	void formatFullyQualifiedName(const DWARF_InfoData* node, char* buf, size_t cbBuf) const;
 
@@ -204,13 +205,10 @@ public:
 	const PEImage* imgDbg;
 	CFIIndex* cfi_index;
 
-	mspdb::PDB* pdb;
-	mspdb::DBI *dbi;
-	mspdb::TPI *tpi;
-	mspdb::TPI *ipi;
+	cv2pdb::PdbWriter* writer;
 
-	mspdb::Mod** modules;
-	mspdb::Mod* globmod;
+	cv2pdb::ModWriter** modules;
+	cv2pdb::ModWriter* globmod;
 	int countEntries;
 
 	OMFSignatureRSDS* rsds;

@@ -35,14 +35,14 @@ static void addTrailingSlash(std::string& dir)
 
 static int cmpAdr(const void* s1, const void* s2)
 {
-	const mspdb::LineInfoEntry* e1 = (const mspdb::LineInfoEntry*) s1;
-	const mspdb::LineInfoEntry* e2 = (const mspdb::LineInfoEntry*) s2;
+	const cv2pdb::LineInfoEntry* e1 = (const cv2pdb::LineInfoEntry*) s1;
+	const cv2pdb::LineInfoEntry* e2 = (const cv2pdb::LineInfoEntry*) s2;
 	return e1->offset - e2->offset;
 }
 
 
 bool printLines(char const *fname, unsigned short sec, char const *secname, unsigned int low_line,
-                mspdb::LineInfoEntry* pLineInfo, long numLineInfo)
+                cv2pdb::LineInfoEntry* pLineInfo, long numLineInfo)
 {
     printf("Sym: %s\n", secname ? secname : "<none>");
     printf("File: %s\n", fname);
@@ -52,7 +52,7 @@ bool printLines(char const *fname, unsigned short sec, char const *secname, unsi
 }
 
 
-bool _flushDWARFLines(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& state)
+bool _flushDWARFLines(const PEImage& img, cv2pdb::ModWriter* mod, DWARF_LineState& state)
 {
 	if(state.lineInfo.size() == 0)
 		return true;
@@ -122,14 +122,14 @@ bool _flushDWARFLines(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& stat
 				low_offset, address_range_length, low_line,
 				(unsigned int)state.lineInfo.size(), fname.c_str());
 
-	rc = mod->AddLines(fname.c_str(), segIndex + 1, low_offset, address_range_length, low_offset, low_line,
+	rc = mod->addLines(fname.c_str(), segIndex + 1, low_offset, address_range_length, low_offset, low_line,
 	                   (unsigned char*)&state.lineInfo[0],
 	                   state.lineInfo.size() * sizeof(state.lineInfo[0]));
 
 #else
 	unsigned int firstLine = 0;
 	unsigned int firstAddr = 0;
-	int rc = mod->AddLines(fname.c_str(), segIndex + 1, saddr, eaddr - saddr, firstAddr, firstLine,
+	int rc = mod->addLines(fname.c_str(), segIndex + 1, saddr, eaddr - saddr, firstAddr, firstLine,
 						   (unsigned char*) &state.lineInfo[0], state.lineInfo.size() * sizeof(state.lineInfo[0]));
 #endif
 
@@ -137,7 +137,7 @@ bool _flushDWARFLines(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& stat
 	return rc > 0;
 }
 
-bool addLineInfo(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& state)
+bool addLineInfo(const PEImage& img, cv2pdb::ModWriter* mod, DWARF_LineState& state)
 {
 	// The DWARF standard says about end_sequence: "indicating that the current
 	// address is that of the first byte after the end of a sequence of target
@@ -148,7 +148,7 @@ bool addLineInfo(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& state)
 
 	if (state.address < state.seg_offset)
 		return true;
-	mspdb::LineInfoEntry entry;
+	cv2pdb::LineInfoEntry entry;
 	entry.offset = state.address - state.seg_offset;
 	if (!state.lineInfo.empty())
 	{
@@ -175,7 +175,7 @@ bool addLineInfo(const PEImage& img, mspdb::Mod* mod, DWARF_LineState& state)
 	return true;
 }
 
-bool interpretDWARFLines(const PEImage& img, mspdb::Mod* mod, DebugLevel debug_)
+bool interpretDWARFLines(const PEImage& img, cv2pdb::ModWriter* mod, DebugLevel debug_)
 {
 
 	DWARF_CompilationUnitInfo cu{};

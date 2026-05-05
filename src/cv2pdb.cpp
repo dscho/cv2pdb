@@ -18,7 +18,7 @@
 static const int typePrefix = 4;
 
 CV2PDB::CV2PDB(PEImage& image, PEImage* imageDWARF, DebugLevel debug_)
-: img(image), imgDbg(imageDWARF ? imageDWARF : &image), pdb(0), dbi(0), tpi(0), ipi(0), libraries(0), rsds(0), rsdsLen(0), modules(0), globmod(0)
+: img(image), imgDbg(imageDWARF ? imageDWARF : &image), writer(0), libraries(0), rsds(0), rsdsLen(0), modules(0), globmod(0)
 , segMap(0), segMapDesc(0), segFrame2Index(0), globalTypeHeader(0)
 , globalTypes(0), cbGlobalTypes(0), allocGlobalTypes(0)
 , userTypes(0), cbUserTypes(0), allocUserTypes(0)
@@ -60,24 +60,18 @@ bool CV2PDB::cleanup(bool commit)
 	if (modules)
 		for (int m = 0; m < countEntries; m++)
 			if (modules[m])
-				modules[m]->Close();
+				modules[m]->close();
 	delete [] modules;
 	if (globmod)
-		globmod->Close();
+		globmod->close();
 
-	if (dbi)
-		dbi->SetMachineType(img.machineType());
-
-	if (ipi)
-		ipi->Close();
-	if (tpi)
-		tpi->Close();
-	if (dbi)
-		dbi->Close();
-	if (pdb)
-		pdb->Commit();
-	if (pdb)
-		pdb->Close();
+	if (writer)
+	{
+		writer->setMachineType(img.machineType());
+		writer->commit();
+		delete writer;
+		writer = 0;
+	}
 
 	if (rsds)
 		delete [] (char*) rsds;
@@ -118,8 +112,7 @@ bool CV2PDB::cleanup(bool commit)
 	modules = 0;
 	globmod = 0;
 	countEntries = 0;
-	dbi = 0;
-	pdb = 0;
+	writer = 0;
 	rsds = 0;
 	segMap = 0;
 	segMapDesc = 0;
@@ -154,48 +147,43 @@ bool CV2PDB::openPDB(const TCHAR* pdbname, const TCHAR* pdbref)
 		GetModuleFileNameA(modMsPdb, modpath, 260);
 		printf("Loaded PDB helper DLL: %s\n", modpath);
 	}
-	pdb = CreatePDB (pdbnameW);
-	if (!pdb)
+	writer = cv2pdb::createMsPdbWriter(pdbnameW);
+	if (!writer)
 		return setError("cannot create PDB file");
 
 #if PRINT_INTERFACEVERSON
-	printf("PDB::QueryInterfaceVersion() = %d\n", pdb->QueryInterfaceVersion());
-	printf("PDB::QueryImplementationVersion() = %d\n", pdb->QueryImplementationVersion());
-	printf("PDB::QueryPdbImplementationVersion() = %d\n", pdb->QueryPdbImplementationVersion());
+	// Diagnostic version printfs were removed when the writer abstraction
+	// was introduced; re-enabling them needs new accessors on PdbWriter.
 #endif
 
 	rsdsLen = offsetof(OMFSignatureRSDS, name) + strlen(pdbnameA) + 1;
 	rsds = (OMFSignatureRSDS *) new char[rsdsLen];
 	memcpy (rsds->Signature, "RSDS", 4);
-	pdb->QuerySignature2(&rsds->guid);
-	rsds->age = pdb->QueryAge();
+	writer->querySignature(&rsds->guid);
+	rsds->age = writer->queryAge();
 	strcpy(rsds->name, pdbnameA);
 
-	int rc = pdb->CreateDBI("", &dbi);
-	if (rc <= 0 || !dbi)
+	int rc = writer->initDbi();
+	if (rc <= 0)
 		return setError("cannot create DBI");
 
 #if PRINT_INTERFACEVERSON
-	printf("DBI::QueryInterfaceVersion() = %d\n", dbi->QueryInterfaceVersion());
-	printf("DBI::QueryImplementationVersion() = %d\n", dbi->QueryImplementationVersion());
 #endif
 
 	// The default is "r" mode.  We need "rw" mode so TPI gets created if it does not exist
-	rc = pdb->OpenTpi("rw", &tpi);
-	if (rc <= 0 || !tpi)
+	rc = writer->initTpi();
+	if (rc <= 0)
 		return setError("cannot create TPI");
 
 	if (mspdb::vsVersion >= 14)
 	{
 		// The default is "r" mode.  We need "rw" mode so IPI gets created if it does not exist
-		rc = pdb->OpenIpi("rw", &ipi);
-		if (rc <= 0 || !ipi)
+		rc = writer->initIpi();
+		if (rc <= 0)
 			return setError("cannot create IPI");
 	}
 
 #if PRINT_INTERFACEVERSON
-	printf("TPI::QueryInterfaceVersion() = %d\n", tpi->QueryInterfaceVersion());
-	printf("TPI::QueryImplementationVersion() = %d\n", tpi->QueryImplementationVersion());
 #endif
 
 	// only add helper for VS2012 or earlier, that default to the old debug engine
@@ -208,8 +196,8 @@ bool CV2PDB::openPDB(const TCHAR* pdbname, const TCHAR* pdbref)
 bool CV2PDB::setError(const char* msg)
 {
 	char pdbmsg[256];
-	if(pdb)
-		pdb->QueryLastError (pdbmsg);
+	if(writer)
+		writer->queryLastError(pdbmsg);
 	return LastError::setError(msg);
 }
 
@@ -217,7 +205,7 @@ bool CV2PDB::createModules()
 {
 	// assumes libraries and segMap initialized
 	countEntries = imgDbg->countCVEntries();
-	modules = new mspdb::Mod* [countEntries];
+	modules = new cv2pdb::ModWriter* [countEntries];
 	memset (modules, 0, countEntries * sizeof(*modules));
 
 	for (int m = 0; m < countEntries; m++)
@@ -232,7 +220,7 @@ bool CV2PDB::createModules()
 			const BYTE* plib = getLibrary (module->iLib);
 			const char* lib = (!plib || !*plib ? name : p2c(plib, 1));
 
-			mspdb::Mod* mod;
+			cv2pdb::ModWriter* mod;
 			if (useGlobalMod)
 			{
 				mod = globalMod();
@@ -243,10 +231,10 @@ bool CV2PDB::createModules()
 			{
 				if (modules[entry->iMod])
 				{
-					modules[entry->iMod]->Close();
+					modules[entry->iMod]->close();
 					modules[entry->iMod] = 0;
 				}
-				int rc = dbi->OpenMod(name, lib, &modules[entry->iMod]);
+				int rc = writer->openMod(name, lib, &modules[entry->iMod]);
 				if (rc <= 0 || !modules[entry->iMod])
 					return setError("cannot create mod");
 				mod = modules[entry->iMod];
@@ -268,7 +256,7 @@ bool CV2PDB::createModules()
 				if (segMap && segIndex < segMap->cSeg)
 					segFlags = segMapDesc[segIndex].flags;
 				segFlags = 0x60101020; // 0x40401040, 0x60500020; // TODO
-				int rc = mod->AddSecContrib(segIndex, segDesc[s].Off, segDesc[s].cbSeg, segFlags);
+				int rc = mod->addSecContrib(segIndex, segDesc[s].Off, segDesc[s].cbSeg, segFlags);
 				if (rc <= 0)
 					return setError("cannot add section contribution to module");
 			}
@@ -277,11 +265,11 @@ bool CV2PDB::createModules()
 	return true;
 }
 
-mspdb::Mod* CV2PDB::globalMod()
+cv2pdb::ModWriter* CV2PDB::globalMod()
 {
 	if (!globmod)
 	{
-		int rc = dbi->OpenMod("__Globals", "__Globals", &globmod);
+		int rc = writer->openMod("__Globals", "__Globals", &globmod);
 		if (rc <= 0 || !globmod)
 			setError("cannot create global module");
 	}
@@ -321,7 +309,7 @@ bool CV2PDB::initSegMap()
 			int maxframe = -1;
 			for (int s = 0; s < segMap->cSeg; s++)
 			{
-				int rc = dbi->AddSec(segMapDesc[s].frame, segMapDesc[s].flags, segMapDesc[s].offset, segMapDesc[s].cbSeg);
+				int rc = writer->addSec(segMapDesc[s].frame, segMapDesc[s].flags, segMapDesc[s].offset, segMapDesc[s].cbSeg);
 				if (rc <= 0)
 					return setError("cannot add section");
 				if (segMapDesc[s].frame > maxframe)
@@ -2620,7 +2608,7 @@ bool CV2PDB::addTypes()
 
 	if (useGlobalMod)
 	{
-		int rc = globalMod()->AddTypes(globalTypes, cbGlobalTypes);
+		int rc = globalMod()->addTypes(globalTypes, cbGlobalTypes);
 		if (rc <= 0)
 			return setError("cannot add type info to module");
 		return true;
@@ -2631,11 +2619,11 @@ bool CV2PDB::addTypes()
 		OMFDirEntry* entry = imgDbg->getCVEntry(m);
 		if(entry->SubSection == sstSrcModule)
 		{
-			mspdb::Mod* mod = modules[entry->iMod];
+			cv2pdb::ModWriter* mod = modules[entry->iMod];
 			if (!mod)
 				return setError("sstSrcModule for non-existing module");
 
-			int rc = mod->AddTypes(globalTypes, cbGlobalTypes);
+			int rc = mod->addTypes(globalTypes, cbGlobalTypes);
 			if (rc <= 0)
 				return setError("cannot add type info to module");
 		}
@@ -2761,7 +2749,7 @@ bool CV2PDB::addSrcLines()
 		OMFDirEntry* entry = imgDbg->getCVEntry(m);
 		if(entry->SubSection == sstSrcModule)
 		{
-			mspdb::Mod* mod = useGlobalMod ? globalMod() : modules[entry->iMod];
+			cv2pdb::ModWriter* mod = useGlobalMod ? globalMod() : modules[entry->iMod];
 			if (!mod)
 				return setError("sstSrcModule for non-existing module");
 
@@ -2796,13 +2784,13 @@ bool CV2PDB::addSrcLines()
 					for (int ln = 1; ln < cnt; ln++)
 						if (lineMin > lineNo[ln])
 							lineMin = lineNo[ln];
-					mspdb::LineInfoEntry* lineInfo = new mspdb::LineInfoEntry[cnt];
+					cv2pdb::LineInfoEntry* lineInfo = new cv2pdb::LineInfoEntry[cnt];
 					for (int ln = 0; ln < cnt; ln++)
 					{
 						lineInfo[ln].offset = sourceLine->offset[ln] - segoff;
 						lineInfo[ln].line = max(0, lineNo[ln] - lineMin); // | 0x80000000; // mark as statement
 					}
-					int rc = mod->AddLines(name, seg, segoff, seglength, segoff, lineMin,
+					int rc = mod->addLines(name, seg, segoff, seglength, segoff, lineMin,
 					                       (unsigned char*) lineInfo, cnt * sizeof(*lineInfo));
 					if (rc <= 0)
 						return setError("cannot add line number info to module");
@@ -2878,7 +2866,7 @@ bool CV2PDB::addSrcLines14()
 		OMFDirEntry* entry = imgDbg->getCVEntry(m);
 		if(entry->SubSection == sstSrcModule)
 		{
-			mspdb::Mod* mod = useGlobalMod ? globalMod() : modules[entry->iMod];
+			cv2pdb::ModWriter* mod = useGlobalMod ? globalMod() : modules[entry->iMod];
 			if (!mod)
 				return setError("sstSrcModule for non-existing module");
 
@@ -2959,7 +2947,7 @@ bool CV2PDB::addSrcLines14()
 		append(buf, F2_all.data(), F2_all.size());
 		align(buf, 4);
 	}
-	int rc = globalMod()->AddSymbols((unsigned char *)buf.data(), buf.size());
+	int rc = globalMod()->addSymbols((unsigned char *)buf.data(), buf.size());
 	if (rc <= 0)
 		return setError("cannot add line number info to module");
 
@@ -2973,7 +2961,7 @@ bool CV2PDB::addPublics()
 		OMFDirEntry* entry = imgDbg->getCVEntry(m);
 		if(entry->SubSection == sstGlobalPub)
 		{
-			mspdb::Mod* mod = 0;
+			cv2pdb::ModWriter* mod = 0;
 			if (entry->iMod < countEntries)
 				mod = useGlobalMod ? globalMod() : modules[entry->iMod];
 
@@ -3000,9 +2988,9 @@ bool CV2PDB::addPublics()
 						fprintf(stderr, "%s:%d: AddPublic2 %s\n", __FUNCTION__, __LINE__, (const char *)symname);
 
 					if (mod)
-						rc = mod->AddPublic2(symname, sym->data_v1.segment, sym->data_v1.offset, type);
+						rc = mod->addPublic(symname, sym->data_v1.segment, sym->data_v1.offset, type);
 					else
-						rc = dbi->AddPublic2(symname, sym->data_v1.segment, sym->data_v1.offset, type);
+						rc = writer->addPublic(symname, sym->data_v1.segment, sym->data_v1.offset, type);
 					if (rc <= 0)
 						return setError("cannot add public");
 					break;
@@ -3375,7 +3363,7 @@ bool CV2PDB::addUdtSymbol(int type, const char* name)
 	return true;
 }
 
-bool CV2PDB::addSymbols(mspdb::Mod* mod, BYTE* symbols, int cb, bool addGlobals)
+bool CV2PDB::addSymbols(cv2pdb::ModWriter* mod, BYTE* symbols, int cb, bool addGlobals)
 {
 	int prefix = mspdb::vsVersion >= 14 ? 3 : 4; // mod == globmod ? 3 : 4;
 	int words = (cb + cbGlobalSymbols + cbStaticSymbols + cbUdtSymbols + 3) / 4 + prefix;
@@ -3388,7 +3376,7 @@ bool CV2PDB::addSymbols(mspdb::Mod* mod, BYTE* symbols, int cb, bool addGlobals)
 	return rc;
 }
 
-bool CV2PDB::writeSymbols(mspdb::Mod* mod, DWORD* data, int databytes, int prefix, bool addGlobals)
+bool CV2PDB::writeSymbols(cv2pdb::ModWriter* mod, DWORD* data, int databytes, int prefix, bool addGlobals)
 {
 	BYTE* bdata = (BYTE*)(data + prefix);
 	if (addGlobals && staticSymbols)
@@ -3403,7 +3391,7 @@ bool CV2PDB::writeSymbols(mspdb::Mod* mod, DWORD* data, int databytes, int prefi
 	data[2] = databytes + 4 * (prefix - 3);
 	if (prefix > 3)
 		data[3] = 1;
-	int rc = mod->AddSymbols((BYTE*) data, ((databytes + 3) / 4 + prefix) * 4);
+	int rc = mod->addSymbols((BYTE*) data, ((databytes + 3) / 4 + prefix) * 4);
 	if (rc <= 0)
 		return setError(
 		    mspdb::vsVersion == 10 ? "cannot add symbols to module, probably msobj100.dll missing"
@@ -3416,7 +3404,7 @@ bool CV2PDB::writeSymbols(mspdb::Mod* mod, DWORD* data, int databytes, int prefi
 
 bool CV2PDB::addSymbols(int iMod, BYTE* symbols, int cb, bool addGlobals)
 {
-	mspdb::Mod* mod = 0;
+	cv2pdb::ModWriter* mod = 0;
 	if (iMod < countEntries)
 		mod = modules[iMod];
 	for (int i = 0; !mod && i < countEntries; i++)
@@ -3441,7 +3429,7 @@ bool CV2PDB::addSymbols()
 	for (int m = 0; m < countEntries; m++)
 	{
 		OMFDirEntry* entry = imgDbg->getCVEntry(m);
-		mspdb::Mod* mod = 0;
+		cv2pdb::ModWriter* mod = 0;
 		BYTE* symbols = imgDbg->CVP<BYTE>(entry->lfo);
 
 		switch(entry->SubSection)
