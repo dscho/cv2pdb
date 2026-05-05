@@ -265,6 +265,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cv2pdb.cpp" />
+    <ClCompile Include="CV2PdbWriter.cpp" />
     <ClCompile Include="cvutil.cpp" />
     <ClCompile Include="demangle.cpp" />
     <ClCompile Include="dwarf2pdb.cpp" />
@@ -277,6 +278,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cv2pdb.h" />
+    <ClInclude Include="CV2PdbWriter.h" />
     <ClInclude Include="cvutil.h" />
     <ClInclude Include="dcvinfo.h" />
     <ClInclude Include="demangle.h" />

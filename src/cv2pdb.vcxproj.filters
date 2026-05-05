@@ -10,6 +10,9 @@
     <ClCompile Include="cv2pdb.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="CV2PdbWriter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="cvutil.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -40,6 +43,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cv2pdb.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CV2PdbWriter.h">
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="cvutil.h">
