@@ -43,6 +43,66 @@ void appendU32LE(std::vector<uint8_t>& v, uint32_t x)
 		v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xff));
 }
 
+#pragma pack(push, 1)
+struct TpiStreamHeader
+{
+	uint32_t Version;
+	uint32_t HeaderSize;
+	uint32_t TypeIndexBegin;
+	uint32_t TypeIndexEnd;
+	uint32_t TypeRecordBytes;
+
+	uint16_t HashStreamIndex;
+	uint16_t HashAuxStreamIndex;
+	uint32_t HashKeySize;
+	uint32_t NumHashBuckets;
+
+	int32_t  HashValueBufferOffset;
+	uint32_t HashValueBufferLength;
+
+	int32_t  IndexOffsetBufferOffset;
+	uint32_t IndexOffsetBufferLength;
+
+	int32_t  HashAdjBufferOffset;
+	uint32_t HashAdjBufferLength;
+};
+#pragma pack(pop)
+static_assert(sizeof(TpiStreamHeader) == 56, "TpiStreamHeader must be 56 bytes");
+
+// TPI and IPI streams share an identical on-disk layout; one builder serves
+// both.  At this stage no records are accumulated, so the builder emits a
+// header with TypeIndexBegin == TypeIndexEnd == 0x1000 and an empty hash
+// stream.  The HashStreamIndex is supplied by the caller so the right index
+// is written into the header even though the stream order is decided by
+// MsfBuilder.
+class TpiStreamBuilder
+{
+public:
+	std::vector<uint8_t> buildStream(uint16_t hashStreamIndex) const
+	{
+		TpiStreamHeader hdr = {};
+		hdr.Version           = 20040203;          // V80
+		hdr.HeaderSize        = sizeof(hdr);
+		hdr.TypeIndexBegin    = 0x1000;
+		hdr.TypeIndexEnd      = 0x1000;            // == Begin: no records yet
+		hdr.TypeRecordBytes   = 0;
+		hdr.HashStreamIndex   = hashStreamIndex;
+		hdr.HashAuxStreamIndex = 0xFFFF;
+		hdr.HashKeySize       = 4;
+		hdr.NumHashBuckets    = 0x40000 - 1;       // 262143
+		// All EmbeddedBuf offsets/lengths stay zero; with no records there
+		// is nothing for the hash stream to point at.
+		std::vector<uint8_t> blob(sizeof(hdr));
+		memcpy(blob.data(), &hdr, sizeof(hdr));
+		return blob;
+	}
+
+	std::vector<uint8_t> buildHashStream() const
+	{
+		return {};
+	}
+};
+
 class NativeModWriter : public ModWriter
 {
 public:
@@ -118,6 +178,9 @@ public:
 	{
 		MsfBuilder msf;
 
+		TpiStreamBuilder tpi;
+		TpiStreamBuilder ipi;
+
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
 		// but no current consumer reads it).
@@ -129,7 +192,10 @@ public:
 		//                    Size=0, Capacity=1,
 		//                    PresentBitmapWordCount=0,
 		//                    DeletedBitmapWordCount=0 }
-		//   Features       { (none for now; will be VC140 once IPI exists) }
+		//   Features       { VC140 = 0x01331E94 }
+		// VC140 advertises the presence of an IPI stream, which we write
+		// below; emitting the feature without the matching stream would
+		// be self-contradictory.
 		std::vector<uint8_t> info;
 		appendU32LE(info, 20000404);          // VC70
 		appendU32LE(info, signature_);
@@ -141,7 +207,21 @@ public:
 		appendU32LE(info, 1);                 // Capacity (must be > 0)
 		appendU32LE(info, 0);                 // PresentBitmapWordCount
 		appendU32LE(info, 0);                 // DeletedBitmapWordCount
+		appendU32LE(info, 0x013351DC);        // VC140 (= 20140508)
 		msf.addStream(std::move(info));
+
+		// Stream layout from here matches the conventional PDB indices:
+		//   2 = TPI, 3 = DBI, 4 = IPI.  The TPI/IPI hash sub-streams are
+		//   placed at 5 and 6 respectively; those indices must be wired
+		//   into the TPI/IPI headers before they are added to the MSF.
+		const uint16_t kTpiHashIndex = 5;
+		const uint16_t kIpiHashIndex = 6;
+
+		msf.addStream(tpi.buildStream(kTpiHashIndex));   // 2: TPI
+		msf.addStream({});                               // 3: DBI placeholder
+		msf.addStream(ipi.buildStream(kIpiHashIndex));   // 4: IPI
+		msf.addStream(tpi.buildHashStream());            // 5: TPI hash
+		msf.addStream(ipi.buildHashStream());            // 6: IPI hash
 
 		return msf.write(path_) ? 1 : 0;
 	}
