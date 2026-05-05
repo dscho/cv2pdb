@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,180 @@ void appendU32LE(std::vector<uint8_t>& v, uint32_t x)
 	for (int i = 0; i < 4; i++)
 		v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xff));
 }
+
+// Lower-cased word-XOR hash used in PDB name hash tables.  Mirrors
+// llvm::pdb::hashStringV1 (llvm/lib/DebugInfo/PDB/Native/Hash.cpp), which
+// in turn mirrors microsoft-pdb's Hasher::lhashPbCb in PDB/include/misc.h.
+uint32_t hashStringV1(const char* data, size_t size)
+{
+	uint32_t result = 0;
+	size_t longs = size / 4;
+	for (size_t i = 0; i < longs; i++)
+	{
+		uint32_t v;
+		memcpy(&v, data + i * 4, 4);
+		result ^= v;
+	}
+	const uint8_t* rest = reinterpret_cast<const uint8_t*>(data) + longs * 4;
+	uint32_t restSize = static_cast<uint32_t>(size % 4);
+	if (restSize >= 2)
+	{
+		uint16_t v;
+		memcpy(&v, rest, 2);
+		result ^= static_cast<uint32_t>(v);
+		rest += 2;
+		restSize -= 2;
+	}
+	if (restSize == 1)
+		result ^= *rest;
+
+	const uint32_t toLowerMask = 0x20202020;
+	result |= toLowerMask;
+	result ^= (result >> 11);
+	return result ^ (result >> 16);
+}
+
+uint32_t nextPowerOfTwo(uint32_t n)
+{
+	uint32_t p = 1;
+	while (p < n)
+		p <<= 1;
+	return p;
+}
+
+// Builds the NameMap blob embedded in the PDB Info stream.  Layout:
+//   uint32_t StringBufferSize
+//   char     StringBuffer[StringBufferSize]
+//   uint32_t Size
+//   uint32_t Capacity
+//   uint32_t PresentBitmapWordCount
+//   uint32_t PresentBitmap[PresentBitmapWordCount]
+//   uint32_t DeletedBitmapWordCount  (always 0; cv2pdb never tombstones)
+//   { uint32_t Key, uint32_t Value } Buckets[Size]   (in bucket-index order)
+// Bucket placement uses linear probing on hashStringV1(name) % Capacity.
+std::vector<uint8_t> buildNameMap(
+    const std::vector<std::pair<std::string, uint32_t>>& entries)
+{
+	std::vector<uint8_t> stringBuffer;
+	std::vector<uint32_t> keyOffsets;
+	keyOffsets.reserve(entries.size());
+	for (const auto& e : entries)
+	{
+		keyOffsets.push_back(static_cast<uint32_t>(stringBuffer.size()));
+		stringBuffer.insert(stringBuffer.end(), e.first.begin(), e.first.end());
+		stringBuffer.push_back(0);
+	}
+
+	uint32_t size = static_cast<uint32_t>(entries.size());
+	uint32_t capacity = nextPowerOfTwo(size * 3 / 2 + 1);
+	if (capacity < 2)
+		capacity = 2;
+
+	// -1 sentinel = empty bucket.
+	std::vector<int32_t> bucketOf(capacity, -1);
+	for (size_t i = 0; i < entries.size(); i++)
+	{
+		const std::string& name = entries[i].first;
+		uint32_t h = hashStringV1(name.data(), name.size());
+		uint32_t b = h % capacity;
+		while (bucketOf[b] != -1)
+			b = (b + 1) % capacity;
+		bucketOf[b] = static_cast<int32_t>(i);
+	}
+
+	uint32_t bitmapWords = (capacity + 31) / 32;
+	std::vector<uint32_t> presentBitmap(bitmapWords, 0);
+	for (uint32_t b = 0; b < capacity; b++)
+		if (bucketOf[b] != -1)
+			presentBitmap[b / 32] |= (1u << (b % 32));
+
+	std::vector<uint8_t> blob;
+	appendU32LE(blob, static_cast<uint32_t>(stringBuffer.size()));
+	blob.insert(blob.end(), stringBuffer.begin(), stringBuffer.end());
+	appendU32LE(blob, size);
+	appendU32LE(blob, capacity);
+	appendU32LE(blob, bitmapWords);
+	for (uint32_t w : presentBitmap)
+		appendU32LE(blob, w);
+	appendU32LE(blob, 0);  // DeletedBitmapWordCount
+	for (uint32_t b = 0; b < capacity; b++)
+	{
+		int32_t entryIdx = bucketOf[b];
+		if (entryIdx < 0)
+			continue;
+		appendU32LE(blob, keyOffsets[entryIdx]);
+		appendU32LE(blob, entries[entryIdx].second);
+	}
+	return blob;
+}
+
+// Builds the /names stream content.  Layout:
+//   uint32_t Magic        (0xEFFEEFFE)
+//   uint32_t HashVersion  (1)
+//   uint32_t ByteSize     (length of NameBuffer)
+//   char     NameBuffer[ByteSize]   (offset 0 reserved as the "no name" slot)
+//   uint32_t HashSize
+//   uint32_t HashEntries[HashSize]  (NameBuffer offsets; 0 means empty slot)
+//   uint32_t NumNames
+class NamesStreamBuilder
+{
+public:
+	NamesStreamBuilder()
+	{
+		// Reserve offset 0 for the conventional "no name" slot.
+		buffer_.push_back(0);
+	}
+
+	// Returns the offset of the (deduplicated) string in NameBuffer.
+	uint32_t addName(const std::string& s)
+	{
+		auto it = lookup_.find(s);
+		if (it != lookup_.end())
+			return it->second;
+		uint32_t off = static_cast<uint32_t>(buffer_.size());
+		buffer_.insert(buffer_.end(), s.begin(), s.end());
+		buffer_.push_back(0);
+		lookup_[s] = off;
+		numNames_++;
+		return off;
+	}
+
+	std::vector<uint8_t> buildStream() const
+	{
+		std::vector<uint8_t> blob;
+		appendU32LE(blob, 0xEFFEEFFE);
+		appendU32LE(blob, 1);
+		appendU32LE(blob, static_cast<uint32_t>(buffer_.size()));
+		blob.insert(blob.end(), buffer_.begin(), buffer_.end());
+
+		// Hash table sizing matches LLVM's PDBStringTableBuilder:
+		//   max(8, NextPowerOfTwo(NumStrings * 3 / 2)).
+		uint32_t hashSize = nextPowerOfTwo(numNames_ * 3 / 2);
+		if (hashSize < 8)
+			hashSize = 8;
+
+		std::vector<uint32_t> table(hashSize, 0);
+		for (const auto& kv : lookup_)
+		{
+			uint32_t h = hashStringV1(kv.first.data(), kv.first.size());
+			uint32_t b = h % hashSize;
+			while (table[b] != 0)
+				b = (b + 1) % hashSize;
+			table[b] = kv.second;
+		}
+
+		appendU32LE(blob, hashSize);
+		for (uint32_t e : table)
+			appendU32LE(blob, e);
+		appendU32LE(blob, numNames_);
+		return blob;
+	}
+
+private:
+	std::vector<uint8_t> buffer_;
+	std::map<std::string, uint32_t> lookup_;
+	uint32_t numNames_ = 0;
+};
 
 #pragma pack(push, 1)
 struct TpiStreamHeader
@@ -301,25 +476,18 @@ public:
 
 		// Stream 1: PDB Info Stream.  Layout (little-endian):
 		//   PdbStreamHeader { Version (VC70), Signature, Age, Guid }
-		//   NameMap        { StringBufferSize=0,
-		//                    Size=0, Capacity=1,
-		//                    PresentBitmapWordCount=0,
-		//                    DeletedBitmapWordCount=0 }
-		//   Features       { VC140 = 0x01331E94 }
-		// VC140 advertises the presence of an IPI stream, which we write
-		// below; emitting the feature without the matching stream would
-		// be self-contradictory.
+		//   NameMap        { StringBuffer + open-addressed hash table }
+		//   Features       { VC140 = 0x013351DC }
+		// The NameMap registers /names so consumers can locate the string
+		// table by name lookup; VC140 advertises the IPI stream.
 		std::vector<uint8_t> info;
 		appendU32LE(info, 20000404);          // VC70
 		appendU32LE(info, signature_);
 		appendU32LE(info, 1);                 // Age
 		const uint8_t* guidBytes = reinterpret_cast<const uint8_t*>(&guid_);
 		info.insert(info.end(), guidBytes, guidBytes + sizeof(guid_));
-		appendU32LE(info, 0);                 // StringBufferSize
-		appendU32LE(info, 0);                 // Size
-		appendU32LE(info, 1);                 // Capacity (must be > 0)
-		appendU32LE(info, 0);                 // PresentBitmapWordCount
-		appendU32LE(info, 0);                 // DeletedBitmapWordCount
+		auto nameMap = buildNameMap({{ "/names", 7 }});
+		info.insert(info.end(), nameMap.begin(), nameMap.end());
 		appendU32LE(info, 0x013351DC);        // VC140 (= 20140508)
 		msf.addStream(std::move(info));
 
@@ -335,6 +503,7 @@ public:
 		msf.addStream(ipi.buildStream(kIpiHashIndex));   // 4: IPI
 		msf.addStream(tpi.buildHashStream());            // 5: TPI hash
 		msf.addStream(ipi.buildHashStream());            // 6: IPI hash
+		msf.addStream(names_.buildStream());             // 7: /names
 
 		return msf.write(path_) ? 1 : 0;
 	}
@@ -347,6 +516,7 @@ private:
 	uint32_t signature_;
 	unsigned short machine_ = 0;
 	std::vector<NativeModWriter*> mods_;
+	NamesStreamBuilder names_;
 };
 
 }  // namespace
