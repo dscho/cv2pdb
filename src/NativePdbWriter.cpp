@@ -273,6 +273,428 @@ struct SectionContribEntry
 #pragma pack(pop)
 static_assert(sizeof(SectionContribEntry) == 28, "SectionContribEntry must be 28 bytes");
 
+// Returns the byte size of a CV numeric leaf at `p` (the first uint16 chooses
+// the encoding).  Caps at `available` for safety on truncated input.
+size_t numericLeafSize(const uint8_t* p, size_t available)
+{
+	if (available < 2)
+		return 0;
+	uint16_t v;
+	memcpy(&v, p, 2);
+	if (v < 0x8000)
+		return 2;
+	switch (v)
+	{
+		case 0x8000: return 3;     // LF_CHAR
+		case 0x8001: return 4;     // LF_SHORT
+		case 0x8002: return 4;     // LF_USHORT
+		case 0x8003: return 6;     // LF_LONG
+		case 0x8004: return 6;     // LF_ULONG
+		case 0x8005: return 6;     // LF_REAL32
+		case 0x8006: return 10;    // LF_REAL64
+		case 0x8009: return 10;    // LF_QUADWORD
+		case 0x800A: return 10;    // LF_UQUADWORD
+		default:     return 2;     // unknown: treat as bare uint16
+	}
+}
+
+// Length of a null-terminated string at `p`, including the null, capped at
+// `available`.
+size_t nullTermSize(const uint8_t* p, size_t available)
+{
+	for (size_t i = 0; i < available; i++)
+		if (p[i] == 0)
+			return i + 1;
+	return available;
+}
+
+// Walks the subrecord stream that backs an LF_FIELDLIST_V2 payload, pushing
+// the byte offset (relative to the fieldlist's payload start) of each
+// 4-byte type-index field onto `refs`.  Returns true if every subrecord kind
+// is one we know how to skip past.  Returns false if it hits an unknown
+// subrecord, in which case the caller must treat the parent fieldlist (and
+// the rest of the TPI dedup pass) conservatively.
+bool walkFieldlistRefs(const uint8_t* payload, size_t size,
+                       std::vector<uint32_t>& refs)
+{
+	size_t off = 0;
+	while (off + 2 <= size)
+	{
+		// LF_PAD0..LF_PAD8 (0xF0..0xF8) are padding bytes between
+		// subrecords; skip them.
+		while (off < size && payload[off] >= 0xF0 && payload[off] <= 0xF8)
+			off++;
+		if (off + 2 > size)
+			break;
+
+		uint16_t subKind;
+		memcpy(&subKind, payload + off, 2);
+
+		switch (subKind)
+		{
+			case 0x1502: // LF_ENUMERATE_V3: id(2) + attr(2) + value(numeric) + name
+			case 0x0403: // LF_ENUMERATE_V1
+			{
+				size_t valueStart = off + 4;
+				if (valueStart > size) return false;
+				size_t vsz = numericLeafSize(payload + valueStart, size - valueStart);
+				if (vsz == 0) return false;
+				size_t nameStart = valueStart + vsz;
+				size_t nsz = nullTermSize(payload + nameStart, size - nameStart);
+				off = nameStart + nsz;
+				break;
+			}
+			case 0x150D: // LF_MEMBER_V3: id(2) + attr(2) + type(4) + offset(numeric) + name
+			case 0x1405: // LF_MEMBER_V2: id(2) + attr(2) + type(4) + offset(numeric) + p_name
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				size_t offStart = off + 8;
+				size_t osz = numericLeafSize(payload + offStart, size - offStart);
+				if (osz == 0) return false;
+				size_t nameStart = offStart + osz;
+				if (subKind == 0x1405)
+				{
+					// p_name: 1-byte length prefix + chars
+					if (nameStart >= size) return false;
+					size_t plen = payload[nameStart];
+					off = nameStart + 1 + plen;
+				}
+				else
+				{
+					size_t nsz = nullTermSize(payload + nameStart, size - nameStart);
+					off = nameStart + nsz;
+				}
+				break;
+			}
+			case 0x1400: // LF_BCLASS_V2: id(2) + attr(2) + type(4) + offset(numeric)
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				size_t offStart = off + 8;
+				size_t osz = numericLeafSize(payload + offStart, size - offStart);
+				if (osz == 0) return false;
+				off = offStart + osz;
+				break;
+			}
+			case 0x1401: // LF_VBCLASS: id(2) + attr(2) + btype(4) + vbtype(4) + offset(numeric) + vbpoff(numeric)
+			case 0x1402: // LF_IVBCLASS
+			{
+				if (off + 12 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));    // btype
+				refs.push_back(static_cast<uint32_t>(off + 8));    // vbtype
+				size_t a = off + 12;
+				size_t asz = numericLeafSize(payload + a, size - a);
+				if (asz == 0) return false;
+				size_t b = a + asz;
+				size_t bsz = numericLeafSize(payload + b, size - b);
+				if (bsz == 0) return false;
+				off = b + bsz;
+				break;
+			}
+			case 0x1404: // LF_INDEX_V2: id(2) + pad(2) + type(4)
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				off += 8;
+				break;
+			}
+			case 0x1409: // LF_VFUNCTAB_V2: id(2) + pad(2) + type(4)
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				off += 8;
+				break;
+			}
+			case 0x1510: // LF_NESTTYPE_V3: id(2) + pad(2) + type(4) + name
+			case 0x140F: // LF_NESTTYPE_V1: id(2) + pad(2) + type(4) + p_name
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				size_t nameStart = off + 8;
+				if (subKind == 0x140F)
+				{
+					if (nameStart >= size) return false;
+					size_t plen = payload[nameStart];
+					off = nameStart + 1 + plen;
+				}
+				else
+				{
+					size_t nsz = nullTermSize(payload + nameStart, size - nameStart);
+					off = nameStart + nsz;
+				}
+				break;
+			}
+			case 0x150E: // LF_STMEMBER_V3: id(2) + attr(2) + type(4) + name
+			case 0x1406: // LF_STMEMBER_V2: id(2) + attr(2) + type(4) + p_name
+			{
+				if (off + 8 > size) return false;
+				refs.push_back(static_cast<uint32_t>(off + 4));
+				size_t nameStart = off + 8;
+				if (subKind == 0x1406)
+				{
+					if (nameStart >= size) return false;
+					size_t plen = payload[nameStart];
+					off = nameStart + 1 + plen;
+				}
+				else
+				{
+					size_t nsz = nullTermSize(payload + nameStart, size - nameStart);
+					off = nameStart + nsz;
+				}
+				break;
+			}
+			default:
+				return false;          // unknown subrecord: bail
+		}
+	}
+	return true;
+}
+
+// Returns the byte offsets (within the record's payload, not counting the
+// 2-byte length + 2-byte kind prefix) of every 4-byte type-index field in
+// the record.  Sets *isKnown to false if the record's leaf kind isn't one
+// we know how to dissect; the caller then bails the whole TPI stream out
+// of dedup mode for safety.
+std::vector<uint32_t> findTypeIndexRefs(uint16_t leafKind,
+                                         const uint8_t* payload,
+                                         size_t payloadSize,
+                                         bool* isKnown)
+{
+	*isKnown = true;
+	std::vector<uint32_t> refs;
+	switch (leafKind)
+	{
+		case 0x1001:                                  // LF_MODIFIER_V2
+			if (payloadSize >= 4) refs.push_back(0);
+			break;
+		case 0x1002:                                  // LF_POINTER_V2
+			if (payloadSize >= 4) refs.push_back(0);
+			break;
+		case 0x1003:                                  // LF_ARRAY_V2
+		case 0x1503:                                  // LF_ARRAY_V3
+			if (payloadSize >= 8)
+			{
+				refs.push_back(0);
+				refs.push_back(4);
+			}
+			break;
+		case 0x1004:                                  // LF_CLASS_V2
+		case 0x1005:                                  // LF_STRUCTURE_V2
+		case 0x1504:                                  // LF_CLASS_V3
+		case 0x1505:                                  // LF_STRUCTURE_V3
+			if (payloadSize >= 16)
+			{
+				refs.push_back(4);                    // fieldlist
+				refs.push_back(8);                    // derived
+				refs.push_back(12);                   // vshape
+			}
+			break;
+		case 0x1006:                                  // LF_UNION_V2
+		case 0x1506:                                  // LF_UNION_V3
+			if (payloadSize >= 8) refs.push_back(4);
+			break;
+		case 0x1007:                                  // LF_ENUM_V2
+		case 0x1507:                                  // LF_ENUM_V3
+			if (payloadSize >= 12)
+			{
+				refs.push_back(4);                    // underlying type
+				refs.push_back(8);                    // fieldlist
+			}
+			break;
+		case 0x1008:                                  // LF_PROCEDURE_V2
+			if (payloadSize >= 12)
+			{
+				refs.push_back(0);                    // rvtype
+				refs.push_back(8);                    // arglist
+			}
+			break;
+		case 0x1201:                                  // LF_ARGLIST_V2
+			if (payloadSize >= 4)
+			{
+				uint32_t count;
+				memcpy(&count, payload, 4);
+				for (uint32_t i = 0; i < count; i++)
+				{
+					if (4 + (i + 1) * 4 > payloadSize) break;
+					refs.push_back(4 + i * 4);
+				}
+			}
+			break;
+		case 0x1203:                                  // LF_FIELDLIST_V2
+			*isKnown = walkFieldlistRefs(payload, payloadSize, refs);
+			if (!*isKnown) refs.clear();
+			break;
+		case 0x100A:                                  // LF_BITFIELD_V2: type at offset 0
+			if (payloadSize >= 4) refs.push_back(0);
+			break;
+		case 0x1009:                                  // LF_MFUNCTION_V2
+			if (payloadSize >= 24)
+			{
+				refs.push_back(0);                    // rvtype
+				refs.push_back(4);                    // class type
+				refs.push_back(8);                    // this type
+				refs.push_back(16);                   // arglist
+			}
+			break;
+		case 0x000A:                                  // LF_VTSHAPE: no type-index refs
+			break;
+		default:
+			*isKnown = false;
+			break;
+	}
+	return refs;
+}
+
+// Returns the byte offset within a CV symbol record's payload (after the
+// 2-byte length + 2-byte kind prefix) of every 4-byte type-index field that
+// references a TPI record.  *isKnown is set to false if the kind isn't one
+// we know how to dissect; the caller then leaves the record alone.
+//
+// Only kinds that cv2pdb actually emits in the DWARF flow are listed;
+// extending this is mechanical (look up the field offsets in mscvpdb.h).
+std::vector<uint32_t> findSymbolTypeIndexRefs(uint16_t kind,
+                                                const uint8_t* /*payload*/,
+                                                size_t payloadSize,
+                                                bool* isKnown)
+{
+	*isKnown = true;
+	std::vector<uint32_t> refs;
+	switch (kind)
+	{
+		// No type references:
+		case 0x0006: // S_END
+		case 0x0001: // S_COMPILE
+		case 0x110E: // S_PUB32 (Flags + Off + Seg + Name)
+		case 0x1101: // S_OBJNAME
+		case 0x113C: // S_COMPILE3
+		case 0x1116: // S_COMPILE2
+		case 0x1012: // S_FRAMEPROC
+		case 0x1103: // S_BLOCK32
+		case 0x1105: // S_LABEL32
+		case 0x1102: // S_THUNK32
+		case 0x114E: // S_INLINESITE_END (scope terminator, no payload)
+		case 0x114F: // S_PROC_ID_END (scope terminator, no payload)
+		case 0x1136: // S_TRAMPOLINE
+		case 0x1141: // S_DEFRANGE
+		case 0x1142: // S_DEFRANGE_SUBFIELD
+		case 0x1143: // S_DEFRANGE_REGISTER
+		case 0x1144: // S_DEFRANGE_FRAMEPOINTER_REL
+		case 0x1145: // S_DEFRANGE_SUBFIELD_REGISTER
+		case 0x114B: // S_DEFRANGE_REGISTER_REL
+		case 0x1107: // S_CONSTANT (V1)
+		case 0x1109: // S_CONSTANT (V2)
+		case 0x1125: // S_PROCREF
+		case 0x1126: // S_DATAREF
+		case 0x1127: // S_LPROCREF
+		case 0x1115: // S_TOKENREF
+		case 0x1124: // S_UNAMESPACE
+		case 0x1132: // S_SECTION
+		case 0x1133: // S_COFFGROUP
+		case 0x1134: // S_EXPORT
+			break;
+
+		// type at payload offset 0 (after kind+length):
+		case 0x1108: // S_UDT_V3 (TypeIndex + Name)
+		case 0x110D: // S_GDATA32 (TypeIndex + Off + Seg + Name)
+		case 0x110C: // S_LDATA32
+		case 0x1112: // S_LTHREAD32
+		case 0x1113: // S_GTHREAD32
+		case 0x110A: // S_CONSTANT_V3 (TypeIndex + value-leaf + Name)
+		case 0x113D: // S_LOCAL (TypeIndex + Flags + Name)
+		case 0x114C: // S_BUILDINFO (TypeIndex only)
+			if (payloadSize >= 4) refs.push_back(0);
+			break;
+
+		// type at payload offset 4 (after a leading uint32):
+		case 0x1111: // S_REGREL32 (Off + TypeIndex + Reg + Name)
+		case 0x110B: // S_BPREL32 (Off + TypeIndex + Name)
+		case 0x1106: // S_REGISTER (TypeIndex + Reg + Name) - actually offset 0
+		case 0x110F: // S_LPROC32 - see below, override
+		case 0x1110: // S_GPROC32 - see below, override
+		case 0x1147: // S_LPROC32_ID - same layout as LPROC32
+		case 0x1148: // S_GPROC32_ID - same layout as GPROC32
+			if (kind == 0x1106)
+			{
+				if (payloadSize >= 4) refs.push_back(0);
+			}
+			else if (kind == 0x110F || kind == 0x1110
+			         || kind == 0x1147 || kind == 0x1148)
+			{
+				// S_*PROC32: parent(4)+end(4)+next(4)+len(4)+dbgStart(4)+
+				// dbgEnd(4)+TypeIndex(4)+offset(4)+segment(2)+flags(1)+name
+				if (payloadSize >= 28) refs.push_back(24);
+			}
+			else
+			{
+				if (payloadSize >= 8) refs.push_back(4);
+			}
+			break;
+
+		// Inline site: parent(4)+end(4)+inlinee(TypeIndex,4)+invocation_data
+		case 0x114D: // S_INLINESITE
+			if (payloadSize >= 12) refs.push_back(8);
+			break;
+
+		// Callsite info: offset(4)+seg(2)+pad(2)+TypeIndex(4)
+		case 0x114A: // S_CALLSITEINFO
+			if (payloadSize >= 12) refs.push_back(8);
+			break;
+
+		// Heap alloc site: offset(4)+seg(2)+instr-len(2)+TypeIndex(4)
+		case 0x115A: // S_HEAPALLOCSITE
+			if (payloadSize >= 12) refs.push_back(8);
+			break;
+
+		default:
+			*isKnown = false;
+			break;
+	}
+	return refs;
+}
+
+// Walk a buffer of length+kind-prefixed CV symbol records, remapping each
+// known-kind record's type-index fields via `remap`.  Records of unknown
+// kinds are left untouched.  Returns the number of records walked.  The
+// records' length fields are not modified, only type-index payload fields
+// at known offsets.
+size_t remapSymbolTypeIndices(uint8_t* records, size_t size,
+                              const std::map<uint32_t, uint32_t>& remap)
+{
+	size_t off = 0;
+	size_t count = 0;
+	while (off + 4 <= size)
+	{
+		uint16_t len, kind;
+		memcpy(&len, records + off, 2);
+		memcpy(&kind, records + off + 2, 2);
+		size_t recordSize = 2 + len;
+		if (recordSize < 4 || off + recordSize > size)
+			break;
+
+		bool isKnown = true;
+		std::vector<uint32_t> refs = findSymbolTypeIndexRefs(
+		    kind, records + off + 4, recordSize - 4, &isKnown);
+		for (uint32_t roff : refs)
+		{
+			size_t fieldOff = off + 4 + roff;
+			if (fieldOff + 4 > size) continue;
+			uint32_t target;
+			memcpy(&target, records + fieldOff, 4);
+			auto it = remap.find(target);
+			if (it != remap.end())
+			{
+				uint32_t mapped = it->second;
+				memcpy(records + fieldOff, &mapped, 4);
+			}
+		}
+
+		off += recordSize;
+		count++;
+	}
+	return count;
+}
+
 #pragma pack(push, 1)
 struct TpiStreamHeader
 {
