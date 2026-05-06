@@ -27,6 +27,7 @@
 #include <rpc.h>
 #pragma comment(lib, "rpcrt4.lib")
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -458,6 +459,10 @@ public:
 		sectionContribs_ = std::move(entries);
 	}
 
+	void setGlobalSymbolStreamIndex(uint16_t idx) { globalSymStream_ = idx; }
+	void setPublicSymbolStreamIndex(uint16_t idx) { publicSymStream_ = idx; }
+	void setSymRecordStreamIndex(uint16_t idx)    { symRecordStream_ = idx; }
+
 	std::vector<uint8_t> buildStream(uint16_t machine) const
 	{
 		// Substream payloads, in the order the DBI stream layout requires:
@@ -507,11 +512,11 @@ public:
 		hdr.VersionSignature        = -1;
 		hdr.VersionHeader           = 19990903;     // V70
 		hdr.Age                     = 1;
-		hdr.GlobalSymbolStreamIndex = 0xFFFF;
+		hdr.GlobalSymbolStreamIndex = globalSymStream_;
 		hdr.BuildNumber             = 0x8E0B;       // 36363, lld-link's value
-		hdr.PublicSymbolStreamIndex = 0xFFFF;
+		hdr.PublicSymbolStreamIndex = publicSymStream_;
 		hdr.PdbDllVersion           = 0;
-		hdr.SymRecordStreamIndex    = 0xFFFF;
+		hdr.SymRecordStreamIndex    = symRecordStream_;
 		hdr.PdbDllRbld              = 0;
 		hdr.ModInfoSize             = static_cast<int32_t>(modInfo_.size());
 		hdr.SectionContributionSize = static_cast<int32_t>(secContrib.size());
@@ -546,6 +551,9 @@ private:
 	std::vector<uint8_t> modInfo_;
 	std::vector<uint8_t> sourceInfo_;
 	std::vector<SectionContribEntry> sectionContribs_;
+	uint16_t globalSymStream_ = 0xFFFF;
+	uint16_t publicSymStream_ = 0xFFFF;
+	uint16_t symRecordStream_ = 0xFFFF;
 };
 
 // Per-module symbol stream and DBI ModInfo entry.  buildStream emits the C13
@@ -573,10 +581,11 @@ public:
 	                    TpiStreamBuilder* tpi,
 	                    uint16_t moduleIndex,
 	                    std::vector<SectionContribEntry>* allSecContribs,
-	                    NamesStreamBuilder* names)
+	                    NamesStreamBuilder* names,
+	                    PdbWriter* writer)
 	    : objName_(std::move(objName)), libName_(std::move(libName)),
 	      tpi_(tpi), moduleIndex_(moduleIndex),
-	      allSecContribs_(allSecContribs), names_(names)
+	      allSecContribs_(allSecContribs), names_(names), writer_(writer)
 	{
 		memset(&primaryContrib_, 0, sizeof(primaryContrib_));
 		primaryContrib_.Section     = -1;       // "no section" sentinel
@@ -717,7 +726,17 @@ public:
 		}
 		return 1;
 	}
-	int addPublic(const char*, unsigned short, long, unsigned long) override { return 1; }
+	int addPublic(const char* name, unsigned short seg, long off,
+	              unsigned long type) override
+	{
+		// mod->AddPublic2 and dbi->AddPublic2 both end up registering the
+		// same kind of S_PUB32 record in the shared symbol records stream;
+		// route per-module calls through the writer-level addPublic so
+		// there is exactly one builder accumulating publics.
+		if (writer_)
+			return writer_->addPublic(name, seg, off, type);
+		return 1;
+	}
 	int addLines(const char* fname, unsigned short seg, long off, long size,
 	             long /*off2*/, unsigned short firstLine,
 	             unsigned char* pLineInfo, long cbLineInfo) override
@@ -880,6 +899,7 @@ private:
 	uint16_t moduleIndex_;
 	std::vector<SectionContribEntry>* allSecContribs_;
 	NamesStreamBuilder* names_;
+	PdbWriter* writer_;
 	std::vector<uint8_t> symbols_;
 	std::vector<uint8_t> checksums_;
 	std::vector<uint8_t> linesSubs_;
@@ -887,6 +907,219 @@ private:
 	std::vector<std::string> sourceFiles_;
 	SectionContribEntry primaryContrib_;
 	bool hasPrimary_ = false;
+};
+
+// Append-only buffer of CV symbol records that the Globals and Publics
+// streams reference by byte offset.  Each record is 4-byte aligned (cv2pdb's
+// only caller is addPublic, which builds an aligned S_PUB32 itself, but
+// future callers might not).
+class SymbolRecordsBuilder
+{
+public:
+	uint32_t append(const std::vector<uint8_t>& record)
+	{
+		uint32_t offset = static_cast<uint32_t>(records_.size());
+		records_.insert(records_.end(), record.begin(), record.end());
+		while (records_.size() % 4 != 0)
+			records_.push_back(0);
+		return offset;
+	}
+
+	const std::vector<uint8_t>& bytes() const { return records_; }
+
+private:
+	std::vector<uint8_t> records_;
+};
+
+// Hash table over (name, recordOffset) tuples used by the Globals stream and,
+// extended with an address map, by the Publics stream.  The on-disk layout
+// is:
+//   GsiHashHeader { VerSignature = 0xFFFFFFFF, VerHdr = 0xF12F091A,
+//                   HrSize = NumRecords * 8,
+//                   NumBuckets = sizeof(Bitmap) + NumPopulatedBuckets * 4 }
+//   PSHashRecord HashRecords[NumRecords]   sorted by (bucket, lower(name))
+//   uint32_t Bitmap[129]                   one bit per bucket; 4097 bits
+//   uint32_t BucketOffsets[NumPopulatedBuckets]  byte offset of each
+//                                                bucket's first HashRecord,
+//                                                expressed in units of the
+//                                                in-memory record size (12)
+//                                                rather than the on-disk
+//                                                size (8).
+//
+// Format references:
+//   - microsoft/microsoft-pdb (PDB/dbi/gsi.cpp, IPHR_HASH = 4096)
+//   - LLVM:
+//     https://llvm.org/docs/PDB/HashStream.html
+//     llvm/lib/DebugInfo/PDB/Native/GSIStreamBuilder.cpp
+class GsiStreamBuilder
+{
+public:
+	static constexpr uint32_t kHashTableSize = 4096;
+	static constexpr uint32_t kBitmapBits = kHashTableSize + 1;     // 4097
+	static constexpr uint32_t kBitmapBytes = ((kBitmapBits + 31) / 32) * 4;  // 516
+
+	// Globals stream entries: just (name, record offset).
+	void addGlobalEntry(const std::string& name, uint32_t recordOffset)
+	{
+		entries_.push_back({name, recordOffset, 0, 0, false});
+	}
+
+	// Publics stream entries: also carry segment + offset for the address map.
+	void addPublicEntry(const std::string& name, uint32_t recordOffset,
+	                    uint16_t segment, uint32_t offset)
+	{
+		entries_.push_back({name, recordOffset, segment, offset, true});
+	}
+
+	// Build the GSI hash payload: header + HashRecords + bitmap + bucket
+	// offsets.  This is what the standalone Globals stream contains.
+	std::vector<uint8_t> buildHashStream() const
+	{
+		std::vector<uint8_t> blob;
+		appendHashStreamPayload(blob);
+		return blob;
+	}
+
+	// Build the Publics stream: PSGSIHDR + GSI hash payload + AddressMap.
+	// AddressMap is a uint32 array of byte offsets into the symbol records
+	// stream, sorted by (segment, offset).
+	std::vector<uint8_t> buildPublicsStream() const
+	{
+		std::vector<uint8_t> hashBlob;
+		appendHashStreamPayload(hashBlob);
+
+		std::vector<uint32_t> addrMap;
+		addrMap.reserve(entries_.size());
+		std::vector<size_t> indices(entries_.size());
+		for (size_t i = 0; i < entries_.size(); i++)
+			indices[i] = i;
+		std::sort(indices.begin(), indices.end(),
+		          [&](size_t a, size_t b) {
+		              const Entry& ea = entries_[a];
+		              const Entry& eb = entries_[b];
+		              if (ea.segment != eb.segment)
+		                  return ea.segment < eb.segment;
+		              return ea.offset < eb.offset;
+		          });
+		for (size_t i : indices)
+			addrMap.push_back(entries_[i].recordOffset);
+
+		std::vector<uint8_t> blob;
+		// PSGSIHDR (28 bytes)
+		appendU32LE(blob, static_cast<uint32_t>(hashBlob.size()));    // SymHash
+		appendU32LE(blob, static_cast<uint32_t>(addrMap.size() * 4)); // AddrMap
+		appendU32LE(blob, 0);                                          // NumThunks
+		appendU32LE(blob, 0);                                          // SizeOfThunk
+		appendU16LE(blob, 0);                                          // ISectThunkTable
+		appendU16LE(blob, 0);                                          // Padding
+		appendU32LE(blob, 0);                                          // OffThunkTable
+		appendU32LE(blob, 0);                                          // NumSections
+
+		blob.insert(blob.end(), hashBlob.begin(), hashBlob.end());
+		for (uint32_t off : addrMap)
+			appendU32LE(blob, off);
+		return blob;
+	}
+
+private:
+	struct Entry
+	{
+		std::string name;
+		uint32_t    recordOffset;
+		uint16_t    segment;
+		uint32_t    offset;
+		bool        isPublic;
+	};
+
+	// Within-bucket sort key for the GSI hash table.  microsoft-pdb's
+	// gsi.cpp uses caseInsensitiveComparePchPchCchCch which compares by
+	// length FIRST and only then by case-insensitive byte content.  Its
+	// HashSym lookup walks the bucket chain and exits early as soon as
+	// the current entry's name compares greater than the target, so the
+	// stored ordering is observable behaviour: getting it wrong makes
+	// dbghelp miss the entry entirely and fall through to a different
+	// hash table (typically picking the public over the global).  See
+	// https://github.com/microsoft/microsoft-pdb/blob/master/PDB/dbi/gsi.cpp
+	static bool nameLess(const std::string& a, const std::string& b)
+	{
+		if (a.size() != b.size())
+			return a.size() < b.size();
+		for (size_t i = 0; i < a.size(); i++)
+		{
+			unsigned char ca = static_cast<unsigned char>(a[i]);
+			unsigned char cb = static_cast<unsigned char>(b[i]);
+			if (ca >= 'A' && ca <= 'Z') ca = static_cast<unsigned char>(ca + 32);
+			if (cb >= 'A' && cb <= 'Z') cb = static_cast<unsigned char>(cb + 32);
+			if (ca != cb)
+				return ca < cb;
+		}
+		return false;
+	}
+
+	void appendHashStreamPayload(std::vector<uint8_t>& blob) const
+	{
+		// Hash each entry; sort by (bucket, name).
+		std::vector<std::pair<uint32_t, size_t>> hashed;
+		hashed.reserve(entries_.size());
+		for (size_t i = 0; i < entries_.size(); i++)
+		{
+			uint32_t h = hashStringV1(entries_[i].name.data(),
+			                          entries_[i].name.size());
+			uint32_t bucket = h % kHashTableSize;
+			hashed.emplace_back(bucket, i);
+		}
+		std::sort(hashed.begin(), hashed.end(),
+		          [&](const std::pair<uint32_t, size_t>& a,
+		              const std::pair<uint32_t, size_t>& b) {
+		              if (a.first != b.first)
+		                  return a.first < b.first;
+		              return nameLess(entries_[a.second].name,
+		                              entries_[b.second].name);
+		          });
+
+		// Bitmap of populated buckets (4097 bits) and bucket-offset table.
+		// Bucket offsets are expressed in units of 12 bytes (the in-memory
+		// record size) per microsoft-pdb's gsi.cpp / LLVM convention, even
+		// though on-disk HashRecord is 8 bytes.
+		std::vector<uint8_t> bitmap(kBitmapBytes, 0);
+		std::vector<uint32_t> bucketOffsets;
+		int32_t prevBucket = -1;
+		for (uint32_t i = 0; i < hashed.size(); i++)
+		{
+			uint32_t b = hashed[i].first;
+			if (static_cast<int32_t>(b) != prevBucket)
+			{
+				bitmap[b / 8] |= static_cast<uint8_t>(1u << (b % 8));
+				bucketOffsets.push_back(i * 12);
+				prevBucket = static_cast<int32_t>(b);
+			}
+		}
+
+		// HashRecords array: 8 bytes per entry.  Off = recordOffset + 1
+		// (off-by-one is part of the format; 0 marks "no record").
+		std::vector<uint8_t> hashRecords;
+		hashRecords.reserve(hashed.size() * 8);
+		for (const auto& kv : hashed)
+		{
+			appendU32LE(hashRecords, entries_[kv.second].recordOffset + 1);
+			appendU32LE(hashRecords, 1);          // CRef
+		}
+
+		uint32_t hrSize = static_cast<uint32_t>(hashRecords.size());
+		uint32_t numBucketsField =
+		    kBitmapBytes + static_cast<uint32_t>(bucketOffsets.size()) * 4;
+
+		appendU32LE(blob, 0xFFFFFFFF);            // VerSignature
+		appendU32LE(blob, 0xF12F091A);            // VerHdr (GSIHashSC V70)
+		appendU32LE(blob, hrSize);
+		appendU32LE(blob, numBucketsField);
+		blob.insert(blob.end(), hashRecords.begin(), hashRecords.end());
+		blob.insert(blob.end(), bitmap.begin(), bitmap.end());
+		for (uint32_t off : bucketOffsets)
+			appendU32LE(blob, off);
+	}
+
+	std::vector<Entry> entries_;
 };
 
 class NativePdbWriter : public PdbWriter
@@ -927,14 +1160,48 @@ public:
 		auto* m = new ModuleStreamBuilder(
 		    objName ? std::string(objName) : std::string(),
 		    libName ? std::string(libName) : std::string(),
-		    &tpi_, modIndex, &sectionContribs_, &names_);
+		    &tpi_, modIndex, &sectionContribs_, &names_, this);
 		mods_.push_back(m);
 		*outMod = m;
 		return 1;
 	}
 
 	int addSec(unsigned short, unsigned short, long, long) override { return 1; }
-	int addPublic(const char*, unsigned short, long, unsigned long) override { return 1; }
+	int addPublic(const char* name, unsigned short seg, long off,
+	              unsigned long /*type*/) override
+	{
+		// cv2pdb passes a CodeView type index in the type argument; S_PUB32
+		// has no type field (the addendum's open question), so the value
+		// is dropped on the floor and Flags stays 0.  Build the record
+		// manually and stash it in the shared symbol records stream, then
+		// register the (name, recordOffset, segment, offset) tuple in the
+		// publics builder so the GSI hash and address map cover it.
+		if (!name)
+			return 1;
+
+		std::string sName(name);
+		std::vector<uint8_t> record;
+		// Reserve the 2-byte length prefix; fill in once the payload is
+		// laid out and padded to 4-byte alignment.
+		record.push_back(0);
+		record.push_back(0);
+		appendU16LE(record, 0x110E);                // S_PUB32
+		appendU32LE(record, 0);                     // Flags (none)
+		appendU32LE(record, static_cast<uint32_t>(off));
+		appendU16LE(record, seg);
+		record.insert(record.end(), sName.begin(), sName.end());
+		record.push_back(0);                        // null terminator
+		while (record.size() % 4 != 0)
+			record.push_back(0);
+		uint16_t lenField = static_cast<uint16_t>(record.size() - 2);
+		record[0] = static_cast<uint8_t>(lenField & 0xFF);
+		record[1] = static_cast<uint8_t>((lenField >> 8) & 0xFF);
+
+		uint32_t recordOffset = symbolRecords_.append(record);
+		publics_.addPublicEntry(sName, recordOffset, seg,
+		                        static_cast<uint32_t>(off));
+		return 1;
+	}
 
 	int querySignature(GUID* guid) override
 	{
@@ -1017,6 +1284,20 @@ public:
 		dbi.setSourceInfoSubstream(std::move(sourceInfo));
 		dbi.setSectionContribs(sectionContribs_);
 
+		// Allocate stream indices for the GSI/PSI/SymbolRecords trio that
+		// the DBI header points at.  Modules occupy 8..7+N, then Globals,
+		// Publics, and SymbolRecords come right after.  Wire those indices
+		// into the DBI header *before* DBI is serialised.
+		uint16_t globalsIndex =
+		    static_cast<uint16_t>(8 + mods_.size());
+		uint16_t publicsIndex =
+		    static_cast<uint16_t>(8 + mods_.size() + 1);
+		uint16_t symRecordsIndex =
+		    static_cast<uint16_t>(8 + mods_.size() + 2);
+		dbi.setGlobalSymbolStreamIndex(globalsIndex);
+		dbi.setPublicSymbolStreamIndex(publicsIndex);
+		dbi.setSymRecordStreamIndex(symRecordsIndex);
+
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
 		// but no current consumer reads it).
@@ -1057,6 +1338,12 @@ public:
 		for (ModuleStreamBuilder* m : mods_)
 			msf.addStream(m->buildStream());
 
+		// Globals / Publics / SymbolRecords streams (indices wired into
+		// the DBI header above).
+		msf.addStream(globals_.buildHashStream());
+		msf.addStream(publics_.buildPublicsStream());
+		msf.addStream(symbolRecords_.bytes());
+
 		return msf.write(path_) ? 1 : 0;
 	}
 
@@ -1071,6 +1358,9 @@ private:
 	NamesStreamBuilder names_;
 	TpiStreamBuilder tpi_;
 	std::vector<SectionContribEntry> sectionContribs_;
+	SymbolRecordsBuilder symbolRecords_;
+	GsiStreamBuilder globals_;
+	GsiStreamBuilder publics_;
 };
 
 }  // namespace
