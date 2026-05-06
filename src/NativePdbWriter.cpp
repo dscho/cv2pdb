@@ -257,6 +257,22 @@ private:
 };
 
 #pragma pack(push, 1)
+struct SectionContribEntry
+{
+	int16_t  Section;
+	int16_t  Padding1;
+	int32_t  Offset;
+	int32_t  Size;
+	uint32_t Characteristics;
+	int16_t  ModuleIndex;
+	int16_t  Padding2;
+	uint32_t DataCrc;
+	uint32_t RelocCrc;
+};
+#pragma pack(pop)
+static_assert(sizeof(SectionContribEntry) == 28, "SectionContribEntry must be 28 bytes");
+
+#pragma pack(push, 1)
 struct TpiStreamHeader
 {
 	uint32_t Version;
@@ -437,6 +453,11 @@ public:
 		sourceInfo_ = std::move(bytes);
 	}
 
+	void setSectionContribs(std::vector<SectionContribEntry> entries)
+	{
+		sectionContribs_ = std::move(entries);
+	}
+
 	std::vector<uint8_t> buildStream(uint16_t machine) const
 	{
 		// Substream payloads, in the order the DBI stream layout requires:
@@ -444,6 +465,11 @@ public:
 		// OptionalDbgHeader.
 		std::vector<uint8_t> secContrib;
 		appendU32LE(secContrib, 0xF12EBA2D); // DbiSecContribVer60
+		for (const auto& e : sectionContribs_)
+		{
+			const uint8_t* p = reinterpret_cast<const uint8_t*>(&e);
+			secContrib.insert(secContrib.end(), p, p + sizeof(e));
+		}
 
 		std::vector<uint8_t> secMap;
 		appendU16LE(secMap, 0);              // Count
@@ -519,13 +545,21 @@ public:
 private:
 	std::vector<uint8_t> modInfo_;
 	std::vector<uint8_t> sourceInfo_;
+	std::vector<SectionContribEntry> sectionContribs_;
 };
 
-// Per-module symbol stream and DBI ModInfo entry.  At this stage no records
-// or C13 subsections are accumulated; the per-module stream is just the C13
-// signature followed by an empty global-refs trailer (8 bytes total).  Later
-// commits will turn the stub add* methods into real accumulators, growing
-// SymByteSize / C13ByteSize / SourceFileCount accordingly.
+// Per-module symbol stream and DBI ModInfo entry.  buildStream emits the C13
+// signature, the accumulated symbol bytes (each S_* record cv2pdb pushed via
+// addSymbols, padded to 4-byte alignment between records when needed), and
+// the trailing GlobalRefCount = 0 / GlobalRefs[] = empty terminator.  C13
+// debug subsections (DEBUG_S_LINES, DEBUG_S_FILECHKSMS, ...) come in a later
+// commit when addLines is wired up.
+//
+// addSecContrib stores each (Section, Offset, Size, Characteristics) tuple
+// twice: once as the module's primary SectionContribEntry (the first call
+// becomes the entry stamped into ModuleInfoHeader.SectionContrib), and once
+// in the writer-level vector that DbiStreamBuilder serialises into the DBI
+// section-contributions substream.
 //
 // Format references for the per-module symbol stream and ModuleInfoHeader:
 //   - microsoft/microsoft-pdb (PDB/include/dbi.h)
@@ -536,11 +570,38 @@ class ModuleStreamBuilder : public ModWriter
 {
 public:
 	ModuleStreamBuilder(std::string objName, std::string libName,
-	                    TpiStreamBuilder* tpi)
+	                    TpiStreamBuilder* tpi,
+	                    uint16_t moduleIndex,
+	                    std::vector<SectionContribEntry>* allSecContribs)
 	    : objName_(std::move(objName)), libName_(std::move(libName)),
-	      tpi_(tpi) {}
+	      tpi_(tpi), moduleIndex_(moduleIndex),
+	      allSecContribs_(allSecContribs)
+	{
+		memset(&primaryContrib_, 0, sizeof(primaryContrib_));
+		primaryContrib_.Section     = -1;       // "no section" sentinel
+		primaryContrib_.ModuleIndex = -1;
+	}
 
-	int addSecContrib(unsigned short, long, long, unsigned long) override { return 1; }
+	int addSecContrib(unsigned short seg, long off, long size,
+	                  unsigned long characteristics) override
+	{
+		SectionContribEntry e = {};
+		e.Section         = static_cast<int16_t>(seg);
+		e.Offset          = static_cast<int32_t>(off);
+		e.Size            = static_cast<int32_t>(size);
+		e.Characteristics = characteristics;
+		e.ModuleIndex     = static_cast<int16_t>(moduleIndex_);
+
+		if (!hasPrimary_)
+		{
+			primaryContrib_ = e;
+			hasPrimary_ = true;
+		}
+		if (allSecContribs_)
+			allSecContribs_->push_back(e);
+		return 1;
+	}
+
 	int addTypes(unsigned char* pTypes, long cbTypes) override
 	{
 		// cv2pdb routes every CodeView type record through mod->AddTypes;
@@ -562,7 +623,99 @@ public:
 		tpi_->addRecords(pTypes + off, static_cast<size_t>(cbTypes) - off);
 		return 1;
 	}
-	int addSymbols(unsigned char*, long) override { return 1; }
+
+	int addSymbols(unsigned char* pSymbols, long cbSymbols) override
+	{
+		// cv2pdb wraps its symbol records in a fake DEBUG_S_SYMBOLS-style
+		// envelope and hands the whole thing to AddSymbols.  Per
+		// cv2pdb.cpp::CV2PDB::writeSymbols, the buffer is:
+		//   data[0] = 4              CV_SIGNATURE_C13
+		//   data[1] = 0xF1           DEBUG_S_SYMBOLS subsection kind
+		//   data[2] = <length>       payload byte count (= databytes when
+		//                              prefix == 3, databytes + 4 when
+		//                              prefix == 4)
+		//   data[3] = 1              (only when prefix == 4, i.e.
+		//                              mspdb::vsVersion < 14, which is the
+		//                              case the native backend hits because
+		//                              it never loads mspdb and vsVersion
+		//                              stays at the default of 8)
+		//   data[prefix..]           actual S_* symbol records, then 0..3
+		//                              bytes of unrelated tail padding to
+		//                              round the buffer to a DWORD count
+		// mspdb peels the prefix off and appends just the records (not the
+		// tail padding) to the raw symbol-records section of the module
+		// stream so consumers find them at offset 4.  The native writer
+		// matches that placement: read the declared payload length from
+		// data[2], reverse the prefix==4 adjustment, and copy exactly that
+		// many bytes from the records area.  Trailing buffer-rounding
+		// bytes get dropped, which is what keeps llvm-pdbutil's record
+		// walker from running past the last real record into zero bytes
+		// that would parse as malformed records.
+		if (!pSymbols || cbSymbols <= 0)
+			return 1;
+
+		bool wrappedC13 = cbSymbols >= 12
+		    && pSymbols[0] == 0x04 && pSymbols[1] == 0
+		    && pSymbols[2] == 0    && pSymbols[3] == 0
+		    && pSymbols[4] == 0xF1 && pSymbols[5] == 0
+		    && pSymbols[6] == 0    && pSymbols[7] == 0;
+		if (!wrappedC13)
+		{
+			// Fallback for any future caller that hands us already-bare
+			// records: just append verbatim.
+			symbols_.insert(symbols_.end(), pSymbols, pSymbols + cbSymbols);
+			while (symbols_.size() % 4 != 0)
+				symbols_.push_back(0);
+			return 1;
+		}
+
+		uint32_t length;
+		memcpy(&length, pSymbols + 8, 4);
+		bool prefix4 = cbSymbols >= 16
+		    && pSymbols[12] == 1 && pSymbols[13] == 0
+		    && pSymbols[14] == 0 && pSymbols[15] == 0;
+		size_t off = prefix4 ? 16 : 12;
+		uint32_t recordBytes = prefix4 ? (length - 4) : length;
+		if (off + recordBytes > static_cast<size_t>(cbSymbols))
+			return 1;                                  // malformed: drop
+
+		// LLVM's symbol-record walker reads each record by its length
+		// field and advances by length + 2 with no separate alignment
+		// step.  cv2pdb produces some records (S_COMPILE, S_GPROC32) that
+		// are already 4-byte-multiples in size, but others (S_UDT_V3 with
+		// short names, etc.) end on an odd byte and would leave the next
+		// record at a misaligned offset.  mspdb papers over that by
+		// stretching each record's length field so the in-record byte
+		// count rounds up to 4.  Do the same here: append the source
+		// record verbatim, pad with zero bytes until the on-disk record
+		// is a 4-byte multiple, then patch the length field to include
+		// the padding.  Trailing zeros in the payload are harmless because
+		// every CV symbol record's parser stops at its own structural
+		// terminator (null-string, fixed-size fields, ...) before that.
+		size_t end = off + recordBytes;
+		while (off + 2 <= end)
+		{
+			uint16_t len;
+			memcpy(&len, pSymbols + off, 2);
+			if (len < 2)
+				break;
+			size_t recordSize = 2 + len;
+			if (off + recordSize > end)
+				break;
+
+			size_t recordStart = symbols_.size();
+			symbols_.insert(symbols_.end(), pSymbols + off,
+			                pSymbols + off + recordSize);
+			while ((symbols_.size() - recordStart) % 4 != 0)
+				symbols_.push_back(0);
+			uint16_t alignedLen = static_cast<uint16_t>(
+			    symbols_.size() - recordStart - 2);
+			memcpy(&symbols_[recordStart], &alignedLen, 2);
+
+			off += recordSize;
+		}
+		return 1;
+	}
 	int addPublic(const char*, unsigned short, long, unsigned long) override { return 1; }
 	int addLines(const char*, unsigned short, long, long, long, unsigned short,
 	             unsigned char*, long) override { return 1; }
@@ -572,12 +725,18 @@ public:
 	{
 		std::vector<uint8_t> blob;
 		appendU32LE(blob, 4);   // CV_SIGNATURE_C13
-		// No symbol records, no C13 subsections.
+		blob.insert(blob.end(), symbols_.begin(), symbols_.end());
+		// C13 subsections (DEBUG_S_LINES / DEBUG_S_FILECHKSMS) come in
+		// the next commit when addLines is wired up.
 		appendU32LE(blob, 0);   // GlobalRefCount
 		return blob;
 	}
 
-	uint32_t symByteSize() const { return 4; }     // signature only
+	uint32_t symByteSize() const
+	{
+		// SymByteSize covers the C13 signature plus the S_* records.
+		return 4 + static_cast<uint32_t>(symbols_.size());
+	}
 	uint32_t c13ByteSize() const { return 0; }
 	uint16_t sourceFileCount() const { return 0; }
 
@@ -585,17 +744,10 @@ public:
 	{
 		std::vector<uint8_t> blob;
 		appendU32LE(blob, 0);                       // Unused1
-		// SectionContribEntry (28 bytes).  No primary contribution yet:
-		// Section = -1 marks "none", everything else stays zero.
-		appendU16LE(blob, 0xFFFF);                  // Section
-		appendU16LE(blob, 0);                       // Padding1
-		appendU32LE(blob, 0);                       // Offset
-		appendU32LE(blob, 0);                       // Size
-		appendU32LE(blob, 0);                       // Characteristics
-		appendU16LE(blob, 0xFFFF);                  // ModuleIndex
-		appendU16LE(blob, 0);                       // Padding2
-		appendU32LE(blob, 0);                       // DataCrc
-		appendU32LE(blob, 0);                       // RelocCrc
+		const uint8_t* scBytes =
+		    reinterpret_cast<const uint8_t*>(&primaryContrib_);
+		blob.insert(blob.end(), scBytes,
+		            scBytes + sizeof(primaryContrib_));
 
 		appendU16LE(blob, 0);                       // Flags
 		appendU16LE(blob, streamIndex);             // ModuleSymStream
@@ -620,6 +772,11 @@ private:
 	std::string objName_;
 	std::string libName_;
 	TpiStreamBuilder* tpi_;
+	uint16_t moduleIndex_;
+	std::vector<SectionContribEntry>* allSecContribs_;
+	std::vector<uint8_t> symbols_;
+	SectionContribEntry primaryContrib_;
+	bool hasPrimary_ = false;
 };
 
 std::vector<uint8_t> buildSourceInfoSubstream(uint32_t numModules)
@@ -671,10 +828,11 @@ public:
 
 	int openMod(const char* objName, const char* libName, ModWriter** outMod) override
 	{
+		uint16_t modIndex = static_cast<uint16_t>(mods_.size());
 		auto* m = new ModuleStreamBuilder(
 		    objName ? std::string(objName) : std::string(),
 		    libName ? std::string(libName) : std::string(),
-		    &tpi_);
+		    &tpi_, modIndex, &sectionContribs_);
 		mods_.push_back(m);
 		*outMod = m;
 		return 1;
@@ -725,6 +883,7 @@ public:
 		dbi.setModInfoSubstream(std::move(modInfo));
 		dbi.setSourceInfoSubstream(
 		    buildSourceInfoSubstream(static_cast<uint32_t>(mods_.size())));
+		dbi.setSectionContribs(sectionContribs_);
 
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
@@ -779,6 +938,7 @@ private:
 	std::vector<ModuleStreamBuilder*> mods_;
 	NamesStreamBuilder names_;
 	TpiStreamBuilder tpi_;
+	std::vector<SectionContribEntry> sectionContribs_;
 };
 
 }  // namespace
