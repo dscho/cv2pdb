@@ -38,10 +38,22 @@ namespace cv2pdb {
 
 namespace {
 
+void appendU16LE(std::vector<uint8_t>& v, uint16_t x)
+{
+	v.push_back(static_cast<uint8_t>(x & 0xff));
+	v.push_back(static_cast<uint8_t>((x >> 8) & 0xff));
+}
+
 void appendU32LE(std::vector<uint8_t>& v, uint32_t x)
 {
 	for (int i = 0; i < 4; i++)
 		v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xff));
+}
+
+void padToAlign4(std::vector<uint8_t>& v)
+{
+	while (v.size() % 4 != 0)
+		v.push_back(0);
 }
 
 // Lower-cased word-XOR hash used in PDB name hash tables.  Mirrors
@@ -305,43 +317,66 @@ struct DbiStreamHeader
 #pragma pack(pop)
 static_assert(sizeof(DbiStreamHeader) == 64, "DbiStreamHeader must be 64 bytes");
 
-// Emits a DBI stream that consumers can parse cleanly but which describes no
-// modules, no section contributions, no section map entries, and no source
-// files.  Future commits will add real content via methods that mirror the
-// cv2pdb::PdbWriter / ModWriter calls (addSec, openMod, addSecContrib, ...).
+// Emits a DBI stream with the requested substream payloads.  Sub-streams that
+// the LLVM reader requires to be sized non-zero get just enough header bytes
+// to make sense; ModInfo and SourceInfo come from the caller as it has the
+// per-module knowledge.
 //
-// All sub-streams that the LLVM reader requires to be sized non-zero carry
-// just enough header bytes to make sense:
-//   - Section Contributions: 4 bytes for the V60 version magic.
-//   - Section Map: 4 bytes for SectionMapHeader{Count=0, LogCount=0}.
-//   - Source Info: 4 bytes for {NumModules=0, NumSourceFiles=0}.
-//   - Optional Debug Header: 22 bytes, eleven kInvalidStreamIndex entries.
-// ModInfo, TypeServerMap, and ECSubstream stay 0-sized; LLVM tolerates that.
+//   - ModInfo:       supplied via setModInfoSubstream (one ModuleInfoHeader +
+//                    null-terminated obj/lib names + 4-byte padding per
+//                    module).  Empty when no modules.
+//   - SectionContrib: 4 bytes for the V60 version magic.
+//   - SectionMap:    4 bytes for SectionMapHeader{Count=0, LogCount=0}.
+//   - SourceInfo:    supplied via setSourceInfoSubstream so it can grow with
+//                    NumModules and per-module file counts; defaults to the
+//                    minimum {NumModules=0, NumSourceFiles=0}.
+//   - OptionalDbgHeader: 22 bytes, eleven kInvalidStreamIndex entries.
+// TypeServerMap and ECSubstream stay 0-sized; LLVM tolerates that.
 class DbiStreamBuilder
 {
 public:
+	void setModInfoSubstream(std::vector<uint8_t> bytes)
+	{
+		modInfo_ = std::move(bytes);
+	}
+
+	void setSourceInfoSubstream(std::vector<uint8_t> bytes)
+	{
+		sourceInfo_ = std::move(bytes);
+	}
+
 	std::vector<uint8_t> buildStream(uint16_t machine) const
 	{
 		// Substream payloads, in the order the DBI stream layout requires:
 		// ModInfo, SecContrib, SecMap, SourceInfo, TypeServerMap, EC,
 		// OptionalDbgHeader.
-		std::vector<uint8_t> modInfo;        // empty: no modules
-
 		std::vector<uint8_t> secContrib;
 		appendU32LE(secContrib, 0xF12EBA2D); // DbiSecContribVer60
 
 		std::vector<uint8_t> secMap;
-		// SectionMapHeader { Count, LogCount }
-		secMap.push_back(0); secMap.push_back(0);   // Count = 0
-		secMap.push_back(0); secMap.push_back(0);   // LogCount = 0
+		appendU16LE(secMap, 0);              // Count
+		appendU16LE(secMap, 0);              // LogCount
 
-		std::vector<uint8_t> sourceInfo;
-		// uint16_t NumModules = 0, uint16_t NumSourceFiles = 0
-		sourceInfo.push_back(0); sourceInfo.push_back(0);
-		sourceInfo.push_back(0); sourceInfo.push_back(0);
+		std::vector<uint8_t> defaultSourceInfo;
+		appendU16LE(defaultSourceInfo, 0);   // NumModules
+		appendU16LE(defaultSourceInfo, 0);   // NumSourceFiles
+		const std::vector<uint8_t>& sourceInfo =
+		    sourceInfo_.empty() ? defaultSourceInfo : sourceInfo_;
 
 		std::vector<uint8_t> typeServerMap;  // empty
-		std::vector<uint8_t> ecSubstream;    // empty
+
+		// EC (Edit and Continue) substream carries a PDB string table that
+		// dump --modules dereferences via DbiStream::getECName for the
+		// ModuleInfoHeader's PdbFilePathNI / SrcFileNameNI fields, even
+		// when those fields are 0 and the per-module HasECInfo flag is
+		// off.  A 0-byte substream leaves ECNames default-constructed and
+		// makes getECName(0) fail with "stream is too short" the moment
+		// the dump tool iterates modules.  Emit a stub PDB string table
+		// (one empty string at offset 0) so the lookup of a 0 NI returns
+		// the empty string.  NamesStreamBuilder produces exactly the
+		// right bytes for this stub when no names are added.
+		NamesStreamBuilder ecStub;
+		std::vector<uint8_t> ecSubstream = ecStub.buildStream();
 
 		std::vector<uint8_t> optDbgHdr;
 		for (int i = 0; i < 11; i++)
@@ -360,7 +395,7 @@ public:
 		hdr.PdbDllVersion           = 0;
 		hdr.SymRecordStreamIndex    = 0xFFFF;
 		hdr.PdbDllRbld              = 0;
-		hdr.ModInfoSize             = static_cast<int32_t>(modInfo.size());
+		hdr.ModInfoSize             = static_cast<int32_t>(modInfo_.size());
 		hdr.SectionContributionSize = static_cast<int32_t>(secContrib.size());
 		hdr.SectionMapSize          = static_cast<int32_t>(secMap.size());
 		hdr.SourceInfoSize          = static_cast<int32_t>(sourceInfo.size());
@@ -373,13 +408,13 @@ public:
 		hdr.Padding                 = 0;
 
 		std::vector<uint8_t> blob;
-		blob.reserve(sizeof(hdr) + modInfo.size() + secContrib.size()
+		blob.reserve(sizeof(hdr) + modInfo_.size() + secContrib.size()
 		             + secMap.size() + sourceInfo.size()
 		             + typeServerMap.size() + ecSubstream.size()
 		             + optDbgHdr.size());
 		const uint8_t* hdrBytes = reinterpret_cast<const uint8_t*>(&hdr);
 		blob.insert(blob.end(), hdrBytes, hdrBytes + sizeof(hdr));
-		blob.insert(blob.end(), modInfo.begin(), modInfo.end());
+		blob.insert(blob.end(), modInfo_.begin(), modInfo_.end());
 		blob.insert(blob.end(), secContrib.begin(), secContrib.end());
 		blob.insert(blob.end(), secMap.begin(), secMap.end());
 		blob.insert(blob.end(), sourceInfo.begin(), sourceInfo.end());
@@ -388,11 +423,29 @@ public:
 		blob.insert(blob.end(), optDbgHdr.begin(), optDbgHdr.end());
 		return blob;
 	}
+
+private:
+	std::vector<uint8_t> modInfo_;
+	std::vector<uint8_t> sourceInfo_;
 };
 
-class NativeModWriter : public ModWriter
+// Per-module symbol stream and DBI ModInfo entry.  At this stage no records
+// or C13 subsections are accumulated; the per-module stream is just the C13
+// signature followed by an empty global-refs trailer (8 bytes total).  Later
+// commits will turn the stub add* methods into real accumulators, growing
+// SymByteSize / C13ByteSize / SourceFileCount accordingly.
+//
+// Format references for the per-module symbol stream and ModuleInfoHeader:
+//   - microsoft/microsoft-pdb (PDB/include/dbi.h)
+//   - LLVM PDB documentation:
+//     https://llvm.org/docs/PDB/ModiStream.html
+//     https://llvm.org/docs/PDB/DbiStream.html#dbi-mod-info-substream
+class ModuleStreamBuilder : public ModWriter
 {
 public:
+	ModuleStreamBuilder(std::string objName, std::string libName)
+	    : objName_(std::move(objName)), libName_(std::move(libName)) {}
+
 	int addSecContrib(unsigned short, long, long, unsigned long) override { return 1; }
 	int addTypes(unsigned char*, long) override { return 1; }
 	int addSymbols(unsigned char*, long) override { return 1; }
@@ -400,7 +453,74 @@ public:
 	int addLines(const char*, unsigned short, long, long, long, unsigned short,
 	             unsigned char*, long) override { return 1; }
 	int close() override { return 1; }
+
+	std::vector<uint8_t> buildStream() const
+	{
+		std::vector<uint8_t> blob;
+		appendU32LE(blob, 4);   // CV_SIGNATURE_C13
+		// No symbol records, no C13 subsections.
+		appendU32LE(blob, 0);   // GlobalRefCount
+		return blob;
+	}
+
+	uint32_t symByteSize() const { return 4; }     // signature only
+	uint32_t c13ByteSize() const { return 0; }
+	uint16_t sourceFileCount() const { return 0; }
+
+	std::vector<uint8_t> buildModInfoEntry(uint16_t streamIndex) const
+	{
+		std::vector<uint8_t> blob;
+		appendU32LE(blob, 0);                       // Unused1
+		// SectionContribEntry (28 bytes).  No primary contribution yet:
+		// Section = -1 marks "none", everything else stays zero.
+		appendU16LE(blob, 0xFFFF);                  // Section
+		appendU16LE(blob, 0);                       // Padding1
+		appendU32LE(blob, 0);                       // Offset
+		appendU32LE(blob, 0);                       // Size
+		appendU32LE(blob, 0);                       // Characteristics
+		appendU16LE(blob, 0xFFFF);                  // ModuleIndex
+		appendU16LE(blob, 0);                       // Padding2
+		appendU32LE(blob, 0);                       // DataCrc
+		appendU32LE(blob, 0);                       // RelocCrc
+
+		appendU16LE(blob, 0);                       // Flags
+		appendU16LE(blob, streamIndex);             // ModuleSymStream
+		appendU32LE(blob, symByteSize());
+		appendU32LE(blob, 0);                       // C11ByteSize
+		appendU32LE(blob, c13ByteSize());
+		appendU16LE(blob, sourceFileCount());
+		appendU16LE(blob, 0);                       // Padding
+		appendU32LE(blob, 0);                       // Unused2
+		appendU32LE(blob, 0);                       // SourceFileNameIndex
+		appendU32LE(blob, 0);                       // PdbFilePathNameIndex
+
+		blob.insert(blob.end(), objName_.begin(), objName_.end());
+		blob.push_back(0);
+		blob.insert(blob.end(), libName_.begin(), libName_.end());
+		blob.push_back(0);
+		padToAlign4(blob);
+		return blob;
+	}
+
+private:
+	std::string objName_;
+	std::string libName_;
 };
+
+std::vector<uint8_t> buildSourceInfoSubstream(uint32_t numModules)
+{
+	std::vector<uint8_t> blob;
+	appendU16LE(blob, static_cast<uint16_t>(numModules));
+	appendU16LE(blob, 0);                           // NumSourceFiles (truncated)
+	for (uint32_t i = 0; i < numModules; i++)
+		appendU16LE(blob, 0);                       // ModIndices[i]
+	for (uint32_t i = 0; i < numModules; i++)
+		appendU16LE(blob, 0);                       // ModFileCounts[i]
+	// FileNameOffsets and NamesBuffer are empty until source files are
+	// plumbed through addLines.
+	padToAlign4(blob);
+	return blob;
+}
 
 class NativePdbWriter : public PdbWriter
 {
@@ -420,7 +540,7 @@ public:
 
 	~NativePdbWriter() override
 	{
-		for (NativeModWriter* m : mods_)
+		for (ModuleStreamBuilder* m : mods_)
 			delete m;
 	}
 
@@ -434,9 +554,11 @@ public:
 		return 1;
 	}
 
-	int openMod(const char*, const char*, ModWriter** outMod) override
+	int openMod(const char* objName, const char* libName, ModWriter** outMod) override
 	{
-		NativeModWriter* m = new NativeModWriter();
+		auto* m = new ModuleStreamBuilder(
+		    objName ? std::string(objName) : std::string(),
+		    libName ? std::string(libName) : std::string());
 		mods_.push_back(m);
 		*outMod = m;
 		return 1;
@@ -468,6 +590,26 @@ public:
 		TpiStreamBuilder tpi;
 		TpiStreamBuilder ipi;
 		DbiStreamBuilder dbi;
+
+		// Pre-assign per-module stream indices.  Fixed streams 0..7 are the
+		// MSF directory placeholder, PDB Info, TPI, DBI, IPI, TPI hash,
+		// IPI hash, and /names.  Module streams take 8..7+N in openMod
+		// order; that ordering needs to be visible to the DBI ModInfo
+		// substream below before commit() lays out the MSF, so the indices
+		// are computed up front rather than being read from MsfBuilder
+		// after addStream.
+		const uint16_t kFirstModuleIndex = 8;
+		std::vector<uint8_t> modInfo;
+		for (size_t i = 0; i < mods_.size(); i++)
+		{
+			uint16_t streamIndex =
+			    static_cast<uint16_t>(kFirstModuleIndex + i);
+			auto entry = mods_[i]->buildModInfoEntry(streamIndex);
+			modInfo.insert(modInfo.end(), entry.begin(), entry.end());
+		}
+		dbi.setModInfoSubstream(std::move(modInfo));
+		dbi.setSourceInfoSubstream(
+		    buildSourceInfoSubstream(static_cast<uint32_t>(mods_.size())));
 
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
@@ -505,6 +647,10 @@ public:
 		msf.addStream(ipi.buildHashStream());            // 6: IPI hash
 		msf.addStream(names_.buildStream());             // 7: /names
 
+		// Per-module symbol streams (8, 9, ...) in openMod order.
+		for (ModuleStreamBuilder* m : mods_)
+			msf.addStream(m->buildStream());
+
 		return msf.write(path_) ? 1 : 0;
 	}
 
@@ -515,7 +661,7 @@ private:
 	GUID guid_;
 	uint32_t signature_;
 	unsigned short machine_ = 0;
-	std::vector<NativeModWriter*> mods_;
+	std::vector<ModuleStreamBuilder*> mods_;
 	NamesStreamBuilder names_;
 };
 
