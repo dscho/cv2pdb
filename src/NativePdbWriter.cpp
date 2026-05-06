@@ -572,10 +572,11 @@ public:
 	ModuleStreamBuilder(std::string objName, std::string libName,
 	                    TpiStreamBuilder* tpi,
 	                    uint16_t moduleIndex,
-	                    std::vector<SectionContribEntry>* allSecContribs)
+	                    std::vector<SectionContribEntry>* allSecContribs,
+	                    NamesStreamBuilder* names)
 	    : objName_(std::move(objName)), libName_(std::move(libName)),
 	      tpi_(tpi), moduleIndex_(moduleIndex),
-	      allSecContribs_(allSecContribs)
+	      allSecContribs_(allSecContribs), names_(names)
 	{
 		memset(&primaryContrib_, 0, sizeof(primaryContrib_));
 		primaryContrib_.Section     = -1;       // "no section" sentinel
@@ -717,8 +718,92 @@ public:
 		return 1;
 	}
 	int addPublic(const char*, unsigned short, long, unsigned long) override { return 1; }
-	int addLines(const char*, unsigned short, long, long, long, unsigned short,
-	             unsigned char*, long) override { return 1; }
+	int addLines(const char* fname, unsigned short seg, long off, long size,
+	             long /*off2*/, unsigned short firstLine,
+	             unsigned char* pLineInfo, long cbLineInfo) override
+	{
+		// cv2pdb hands us one (function, source-file) pair per call.  Each
+		// call lands as one DEBUG_S_LINES subsection in the module's C13
+		// area, with its NameIndex pointing into a single per-module
+		// DEBUG_S_FILECHKSMS subsection that we accumulate alongside.  The
+		// source-file path itself goes into the global /names stream and
+		// the FileChecksumEntryHeader's NameOffset references that.
+		if (!fname || !pLineInfo || cbLineInfo <= 0 || !names_)
+			return 1;
+		if (cbLineInfo % sizeof(LineInfoEntry) != 0)
+			return 1;
+		uint32_t numLines =
+		    static_cast<uint32_t>(cbLineInfo / sizeof(LineInfoEntry));
+		if (numLines == 0)
+			return 1;
+
+		uint32_t namesOffset = names_->addName(fname);
+		auto it = fileChecksumOffset_.find(namesOffset);
+		uint32_t chksumOffset;
+		if (it == fileChecksumOffset_.end())
+		{
+			chksumOffset = static_cast<uint32_t>(checksums_.size());
+			fileChecksumOffset_[namesOffset] = chksumOffset;
+			sourceFiles_.push_back(fname);
+			// FileChecksumEntryHeader: NameOffset (u32) + ChecksumSize (u8)
+			// + ChecksumKind (u8) = 6 bytes; pad to 4.  ChecksumKind = 0
+			// (None) means "no checksum bytes follow".
+			appendU32LE(checksums_, namesOffset);
+			checksums_.push_back(0);    // ChecksumSize
+			checksums_.push_back(0);    // ChecksumKind = None
+			while (checksums_.size() % 4 != 0)
+				checksums_.push_back(0);
+		}
+		else
+		{
+			chksumOffset = it->second;
+		}
+
+		const LineInfoEntry* entries =
+		    reinterpret_cast<const LineInfoEntry*>(pLineInfo);
+
+		std::vector<uint8_t> payload;
+		// LineFragmentHeader: RelocOffset, RelocSegment, Flags, CodeSize.
+		// cv2pdb's dwarflines.cpp computes `size` as the address-range
+		// length already minus one: the comment in dwarflines.cpp around
+		// the `--high_offset` line says "AddLines will immediately
+		// increment it to 0", which is mspdb's mod->AddLines bumping the
+		// value back up by one before it writes the CodeSize field on
+		// the wire.  We have to do the same; without it the on-disk
+		// CodeSize is N-1 for any line range of length N, and worse, a
+		// single-instruction range comes in with `size = 0` which
+		// underflows to 0xFFFFFFFF and dbghelp drops the entire
+		// DEBUG_S_LINES subsection as malformed.
+		uint32_t codeSize = static_cast<uint32_t>(size) + 1;
+		appendU32LE(payload, static_cast<uint32_t>(off));
+		appendU16LE(payload, seg);
+		appendU16LE(payload, 0);                  // no columns
+		appendU32LE(payload, codeSize);
+
+		// LineBlockFragmentHeader: NameIndex (offset within FILECHKSMS),
+		// NumLines, BlockSize (= sizeof(this) + NumLines * 8).
+		appendU32LE(payload, chksumOffset);
+		appendU32LE(payload, numLines);
+		appendU32LE(payload, 12 + numLines * 8);
+
+		for (uint32_t i = 0; i < numLines; i++)
+		{
+			uint32_t lineOff = entries[i].offset;
+			uint32_t actualLine =
+			    static_cast<uint32_t>(firstLine) + entries[i].line;
+			uint32_t flags = (actualLine & 0xFFFFFF) | (1u << 31);   // IsStatement
+			appendU32LE(payload, lineOff);
+			appendU32LE(payload, flags);
+		}
+
+		// Wrap as DEBUG_S_LINES (Kind 0xF2) subsection.
+		appendU32LE(linesSubs_, 0xF2);
+		appendU32LE(linesSubs_, static_cast<uint32_t>(payload.size()));
+		linesSubs_.insert(linesSubs_.end(), payload.begin(), payload.end());
+		while (linesSubs_.size() % 4 != 0)
+			linesSubs_.push_back(0);
+		return 1;
+	}
 	int close() override { return 1; }
 
 	std::vector<uint8_t> buildStream() const
@@ -726,8 +811,18 @@ public:
 		std::vector<uint8_t> blob;
 		appendU32LE(blob, 4);   // CV_SIGNATURE_C13
 		blob.insert(blob.end(), symbols_.begin(), symbols_.end());
-		// C13 subsections (DEBUG_S_LINES / DEBUG_S_FILECHKSMS) come in
-		// the next commit when addLines is wired up.
+
+		// C13 subsection block: FILECHKSMS first (so per-line NameIndex
+		// references are valid forward into this subsection's payload),
+		// then any number of DEBUG_S_LINES subsections.
+		if (!checksums_.empty())
+		{
+			appendU32LE(blob, 0xF4);   // DEBUG_S_FILECHKSMS
+			appendU32LE(blob, static_cast<uint32_t>(checksums_.size()));
+			blob.insert(blob.end(), checksums_.begin(), checksums_.end());
+		}
+		blob.insert(blob.end(), linesSubs_.begin(), linesSubs_.end());
+
 		appendU32LE(blob, 0);   // GlobalRefCount
 		return blob;
 	}
@@ -737,8 +832,18 @@ public:
 		// SymByteSize covers the C13 signature plus the S_* records.
 		return 4 + static_cast<uint32_t>(symbols_.size());
 	}
-	uint32_t c13ByteSize() const { return 0; }
-	uint16_t sourceFileCount() const { return 0; }
+	uint32_t c13ByteSize() const
+	{
+		uint32_t size = static_cast<uint32_t>(linesSubs_.size());
+		if (!checksums_.empty())
+			size += 8 + static_cast<uint32_t>(checksums_.size());
+		return size;
+	}
+	uint16_t sourceFileCount() const
+	{
+		return static_cast<uint16_t>(sourceFiles_.size());
+	}
+	const std::vector<std::string>& sourceFiles() const { return sourceFiles_; }
 
 	std::vector<uint8_t> buildModInfoEntry(uint16_t streamIndex) const
 	{
@@ -774,25 +879,15 @@ private:
 	TpiStreamBuilder* tpi_;
 	uint16_t moduleIndex_;
 	std::vector<SectionContribEntry>* allSecContribs_;
+	NamesStreamBuilder* names_;
 	std::vector<uint8_t> symbols_;
+	std::vector<uint8_t> checksums_;
+	std::vector<uint8_t> linesSubs_;
+	std::map<uint32_t, uint32_t> fileChecksumOffset_;
+	std::vector<std::string> sourceFiles_;
 	SectionContribEntry primaryContrib_;
 	bool hasPrimary_ = false;
 };
-
-std::vector<uint8_t> buildSourceInfoSubstream(uint32_t numModules)
-{
-	std::vector<uint8_t> blob;
-	appendU16LE(blob, static_cast<uint16_t>(numModules));
-	appendU16LE(blob, 0);                           // NumSourceFiles (truncated)
-	for (uint32_t i = 0; i < numModules; i++)
-		appendU16LE(blob, 0);                       // ModIndices[i]
-	for (uint32_t i = 0; i < numModules; i++)
-		appendU16LE(blob, 0);                       // ModFileCounts[i]
-	// FileNameOffsets and NamesBuffer are empty until source files are
-	// plumbed through addLines.
-	padToAlign4(blob);
-	return blob;
-}
 
 class NativePdbWriter : public PdbWriter
 {
@@ -832,7 +927,7 @@ public:
 		auto* m = new ModuleStreamBuilder(
 		    objName ? std::string(objName) : std::string(),
 		    libName ? std::string(libName) : std::string(),
-		    &tpi_, modIndex, &sectionContribs_);
+		    &tpi_, modIndex, &sectionContribs_, &names_);
 		mods_.push_back(m);
 		*outMod = m;
 		return 1;
@@ -881,8 +976,45 @@ public:
 			modInfo.insert(modInfo.end(), entry.begin(), entry.end());
 		}
 		dbi.setModInfoSubstream(std::move(modInfo));
-		dbi.setSourceInfoSubstream(
-		    buildSourceInfoSubstream(static_cast<uint32_t>(mods_.size())));
+
+		// Build SourceInfo from accumulated per-module file lists.  Layout
+		// is: NumModules / NumSourceFiles (truncated to u16) / ModIndices
+		// (zeros, ignored by readers) / ModFileCounts / FileNameOffsets[
+		// totalFiles] / NamesBuffer.  The path strings here are a separate
+		// copy from the global /names buffer; older readers consult this
+		// substream directly while newer ones go through the C13
+		// FILECHKSMS / NameOffset chain.
+		std::vector<uint8_t> sourceInfo;
+		uint32_t totalFiles = 0;
+		for (ModuleStreamBuilder* m : mods_)
+			totalFiles += static_cast<uint32_t>(m->sourceFiles().size());
+		uint16_t numFilesU16 = totalFiles > 0xFFFF
+		    ? static_cast<uint16_t>(0xFFFF)
+		    : static_cast<uint16_t>(totalFiles);
+		appendU16LE(sourceInfo, static_cast<uint16_t>(mods_.size()));
+		appendU16LE(sourceInfo, numFilesU16);
+		for (size_t i = 0; i < mods_.size(); i++)
+			appendU16LE(sourceInfo, 0);                  // ModIndices
+		for (ModuleStreamBuilder* m : mods_)
+			appendU16LE(sourceInfo,
+			            static_cast<uint16_t>(m->sourceFiles().size()));
+		std::vector<uint32_t> fileOffsets;
+		std::vector<uint8_t> sourceNames;
+		for (ModuleStreamBuilder* m : mods_)
+		{
+			for (const std::string& path : m->sourceFiles())
+			{
+				fileOffsets.push_back(
+				    static_cast<uint32_t>(sourceNames.size()));
+				sourceNames.insert(sourceNames.end(), path.begin(), path.end());
+				sourceNames.push_back(0);
+			}
+		}
+		for (uint32_t fo : fileOffsets)
+			appendU32LE(sourceInfo, fo);
+		sourceInfo.insert(sourceInfo.end(), sourceNames.begin(), sourceNames.end());
+		padToAlign4(sourceInfo);
+		dbi.setSourceInfoSubstream(std::move(sourceInfo));
 		dbi.setSectionContribs(sectionContribs_);
 
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
