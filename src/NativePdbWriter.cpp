@@ -462,6 +462,7 @@ public:
 	void setGlobalSymbolStreamIndex(uint16_t idx) { globalSymStream_ = idx; }
 	void setPublicSymbolStreamIndex(uint16_t idx) { publicSymStream_ = idx; }
 	void setSymRecordStreamIndex(uint16_t idx)    { symRecordStream_ = idx; }
+	void setSectionHeaderStreamIndex(uint16_t idx) { sectionHdrStream_ = idx; }
 
 	std::vector<uint8_t> buildStream(uint16_t machine) const
 	{
@@ -501,11 +502,20 @@ public:
 		NamesStreamBuilder ecStub;
 		std::vector<uint8_t> ecSubstream = ecStub.buildStream();
 
+		// Optional Debug Header substream: 11 stream-index slots.  cv2pdb's
+		// in-house writer fills slot [5] (Section Header) when the input
+		// PE's section-header array is available.  Everything else is
+		// kInvalidStreamIndex (0xFFFF), matching the cv2pdb-mspdb baseline.
+		uint16_t optDbgHdrIndices[11] = {
+		    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+		    sectionHdrStream_,
+		    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+		};
 		std::vector<uint8_t> optDbgHdr;
 		for (int i = 0; i < 11; i++)
 		{
-			optDbgHdr.push_back(0xFF);
-			optDbgHdr.push_back(0xFF);
+			optDbgHdr.push_back(static_cast<uint8_t>(optDbgHdrIndices[i] & 0xFF));
+			optDbgHdr.push_back(static_cast<uint8_t>((optDbgHdrIndices[i] >> 8) & 0xFF));
 		}
 
 		DbiStreamHeader hdr = {};
@@ -554,6 +564,7 @@ private:
 	uint16_t globalSymStream_ = 0xFFFF;
 	uint16_t publicSymStream_ = 0xFFFF;
 	uint16_t symRecordStream_ = 0xFFFF;
+	uint16_t sectionHdrStream_ = 0xFFFF;
 };
 
 // Per-module symbol stream and DBI ModInfo entry.  buildStream emits the C13
@@ -1219,6 +1230,15 @@ public:
 		return 0;
 	}
 
+	int setImageSectionHeaders(const void* data, size_t size) override
+	{
+		if (data && size > 0)
+			sectionHeaders_.assign(
+			    static_cast<const uint8_t*>(data),
+			    static_cast<const uint8_t*>(data) + size);
+		return 1;
+	}
+
 	int commit() override
 	{
 		MsfBuilder msf;
@@ -1298,6 +1318,18 @@ public:
 		dbi.setPublicSymbolStreamIndex(publicsIndex);
 		dbi.setSymRecordStreamIndex(symRecordsIndex);
 
+		// Optional Section Header debug stream sits right after the
+		// SymbolRecords stream when present.  When cv2pdb didn't hand us
+		// the bytes, leave the slot empty and let DbiStreamBuilder default
+		// to kInvalidStreamIndex.
+		uint16_t sectionHdrIndex = 0xFFFF;
+		if (!sectionHeaders_.empty())
+		{
+			sectionHdrIndex =
+			    static_cast<uint16_t>(8 + mods_.size() + 3);
+			dbi.setSectionHeaderStreamIndex(sectionHdrIndex);
+		}
+
 		// Stream 0: "Old MSF Directory" placeholder, empty (lld-link does
 		// the same; mspdb keeps 40 stale bytes from the previous commit
 		// but no current consumer reads it).
@@ -1344,6 +1376,10 @@ public:
 		msf.addStream(publics_.buildPublicsStream());
 		msf.addStream(symbolRecords_.bytes());
 
+		// Optional Section Header debug stream when cv2pdb supplied bytes.
+		if (!sectionHeaders_.empty())
+			msf.addStream(sectionHeaders_);
+
 		return msf.write(path_) ? 1 : 0;
 	}
 
@@ -1361,6 +1397,7 @@ private:
 	SymbolRecordsBuilder symbolRecords_;
 	GsiStreamBuilder globals_;
 	GsiStreamBuilder publics_;
+	std::vector<uint8_t> sectionHeaders_;
 };
 
 }  // namespace

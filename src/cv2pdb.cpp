@@ -156,6 +156,19 @@ bool CV2PDB::openPDB(const TCHAR* pdbname, const TCHAR* pdbref)
 	if (!writer)
 		return setError("cannot create PDB file");
 
+	// Hand the input PE/COFF section-header array to the writer so the
+	// optional Section Header debug stream can be populated.  Done here
+	// rather than in cleanup() because writeDWARFImage replaces the input
+	// debug section in place and frees the original memory backing
+	// img.getSection(0); the resulting dangling pointer would crash any
+	// later read.  At openPDB time, in either CodeView or DWARF flow, the
+	// PE has been loaded and its section headers are stable.
+	if (img.countSections() > 0)
+		writer->setImageSectionHeaders(
+		    &img.getSection(0),
+		    static_cast<size_t>(img.countSections())
+		        * sizeof(IMAGE_SECTION_HEADER));
+
 #if PRINT_INTERFACEVERSON
 	// Diagnostic version printfs were removed when the writer abstraction
 	// was introduced; re-enabling them needs new accessors on PdbWriter.

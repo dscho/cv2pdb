@@ -141,6 +141,13 @@ public:
 		return pdb_ ? pdb_->QueryLastError(buf) : 0;
 	}
 
+	int setImageSectionHeaders(const void*, size_t) override
+	{
+		// mspdb has no equivalent API.  Return success so callers see the
+		// legacy behaviour: no Section Header debug stream in the output.
+		return 1;
+	}
+
 	int commit() override
 	{
 		return closeAll(/*commit=*/true);

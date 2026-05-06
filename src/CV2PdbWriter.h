@@ -84,6 +84,14 @@ public:
 	// that have no equivalent.  Buffer must be at least 256 bytes.
 	virtual int queryLastError(char* buf) = 0;
 
+	// Hand the writer the input PE/COFF image's IMAGE_SECTION_HEADER array
+	// so it can be copied verbatim into the optional Section Header debug
+	// stream.  Visual Studio uses that stream to map RVAs to symbols when
+	// loading a PDB.  Backends without a native API for this (mspdb) may
+	// return 1 without doing anything; the resulting PDB simply lacks the
+	// auxiliary stream, which matches the legacy cv2pdb-mspdb output.
+	virtual int setImageSectionHeaders(const void* data, size_t size) = 0;
+
 	// Closes IPI/TPI/DBI/PDB and writes the file.
 	virtual int commit() = 0;
 
