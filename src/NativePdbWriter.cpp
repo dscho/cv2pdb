@@ -38,6 +38,32 @@ namespace cv2pdb {
 
 namespace {
 
+// JamCRC (CRC-32 reversed polynomial, init = 0) used as the per-record hash
+// in the TPI/IPI hash streams.  Mirrors llvm::pdb::hashBufferV8, which wraps
+// llvm::JamCRC with Init=0.  Polynomial 0xEDB88320 is the bit-reversal of the
+// IEEE 802.3 CRC-32 polynomial 0x04C11DB7.  The lookup table is built lazily
+// the first time this function runs.
+uint32_t hashBufferV8(const uint8_t* buf, size_t size)
+{
+	static uint32_t table[256];
+	static bool initialised = false;
+	if (!initialised)
+	{
+		for (uint32_t i = 0; i < 256; i++)
+		{
+			uint32_t c = i;
+			for (int j = 0; j < 8; j++)
+				c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+			table[i] = c;
+		}
+		initialised = true;
+	}
+	uint32_t crc = 0;
+	for (size_t i = 0; i < size; i++)
+		crc = (crc >> 8) ^ table[(crc ^ buf[i]) & 0xff];
+	return crc;
+}
+
 void appendU16LE(std::vector<uint8_t>& v, uint16_t x)
 {
 	v.push_back(static_cast<uint8_t>(x & 0xff));
@@ -257,37 +283,103 @@ struct TpiStreamHeader
 static_assert(sizeof(TpiStreamHeader) == 56, "TpiStreamHeader must be 56 bytes");
 
 // TPI and IPI streams share an identical on-disk layout; one builder serves
-// both.  At this stage no records are accumulated, so the builder emits a
-// header with TypeIndexBegin == TypeIndexEnd == 0x1000 and an empty hash
-// stream.  The HashStreamIndex is supplied by the caller so the right index
-// is written into the header even though the stream order is decided by
-// MsfBuilder.
+// both.  CodeView records are appended via addRecords(), which also computes
+// the hash-stream sidecar (one hashBufferV8 entry per record, plus a sparse
+// IndexOffsetBuffer entry on the first record and every IndexOffsetGranBytes
+// thereafter).  buildStream emits the 56-byte header with TypeIndexEnd,
+// TypeRecordBytes, and the hash-buffer offset/length triples filled in;
+// buildHashStream emits the matching hash payload.
 class TpiStreamBuilder
 {
 public:
+	static constexpr uint32_t kFirstTypeIndex = 0x1000;
+	static constexpr uint32_t kNumHashBuckets = 0x40000 - 1;   // 262143
+	static constexpr uint32_t kIndexOffsetGranBytes = 8 * 1024;
+
+	void addRecords(const uint8_t* buf, size_t cb)
+	{
+		size_t off = 0;
+		while (off + 2 <= cb)
+		{
+			uint16_t len;
+			memcpy(&len, buf + off, 2);
+			size_t recordSize = 2 + len;       // 2-byte length prefix + payload
+			if (recordSize < 4 || off + recordSize > cb)
+				break;                         // truncated or malformed
+
+			uint32_t recBlobOffset =
+			    static_cast<uint32_t>(records_.size());
+			uint32_t typeIndex = kFirstTypeIndex + numRecords_;
+
+			// Sparse IndexOffsetBuffer: always emit on the very first
+			// record so that bisection has a starting point at offset 0,
+			// then again every kIndexOffsetGranBytes of accumulated record
+			// bytes.  Matches LLVM's TpiStreamBuilder.
+			if (numRecords_ == 0
+			    || (recBlobOffset - lastIobOffset_) >= kIndexOffsetGranBytes)
+			{
+				indexOffsets_.emplace_back(typeIndex, recBlobOffset);
+				lastIobOffset_ = recBlobOffset;
+			}
+
+			records_.insert(records_.end(), buf + off, buf + off + recordSize);
+
+			uint32_t hash = hashBufferV8(buf + off, recordSize) % kNumHashBuckets;
+			appendU32LE(hashValues_, hash);
+
+			numRecords_++;
+			off += recordSize;
+		}
+	}
+
 	std::vector<uint8_t> buildStream(uint16_t hashStreamIndex) const
 	{
 		TpiStreamHeader hdr = {};
-		hdr.Version           = 20040203;          // V80
-		hdr.HeaderSize        = sizeof(hdr);
-		hdr.TypeIndexBegin    = 0x1000;
-		hdr.TypeIndexEnd      = 0x1000;            // == Begin: no records yet
-		hdr.TypeRecordBytes   = 0;
-		hdr.HashStreamIndex   = hashStreamIndex;
+		hdr.Version            = 20040203;          // V80
+		hdr.HeaderSize         = sizeof(hdr);
+		hdr.TypeIndexBegin     = kFirstTypeIndex;
+		hdr.TypeIndexEnd       = kFirstTypeIndex + numRecords_;
+		hdr.TypeRecordBytes    = static_cast<uint32_t>(records_.size());
+		hdr.HashStreamIndex    = hashStreamIndex;
 		hdr.HashAuxStreamIndex = 0xFFFF;
-		hdr.HashKeySize       = 4;
-		hdr.NumHashBuckets    = 0x40000 - 1;       // 262143
-		// All EmbeddedBuf offsets/lengths stay zero; with no records there
-		// is nothing for the hash stream to point at.
+		hdr.HashKeySize        = 4;
+		hdr.NumHashBuckets     = kNumHashBuckets;
+
+		uint32_t hashValueBytes = static_cast<uint32_t>(hashValues_.size());
+		uint32_t iobBytes = 8 * static_cast<uint32_t>(indexOffsets_.size());
+
+		hdr.HashValueBufferOffset   = 0;
+		hdr.HashValueBufferLength   = hashValueBytes;
+		hdr.IndexOffsetBufferOffset = static_cast<int32_t>(hashValueBytes);
+		hdr.IndexOffsetBufferLength = iobBytes;
+		hdr.HashAdjBufferOffset     =
+		    static_cast<int32_t>(hashValueBytes + iobBytes);
+		hdr.HashAdjBufferLength     = 0;
+
 		std::vector<uint8_t> blob(sizeof(hdr));
 		memcpy(blob.data(), &hdr, sizeof(hdr));
+		blob.insert(blob.end(), records_.begin(), records_.end());
 		return blob;
 	}
 
 	std::vector<uint8_t> buildHashStream() const
 	{
-		return {};
+		std::vector<uint8_t> blob;
+		blob.insert(blob.end(), hashValues_.begin(), hashValues_.end());
+		for (const auto& iob : indexOffsets_)
+		{
+			appendU32LE(blob, iob.first);    // TypeIndex
+			appendU32LE(blob, iob.second);   // ByteOffset in record blob
+		}
+		return blob;
 	}
+
+private:
+	std::vector<uint8_t> records_;
+	std::vector<uint8_t> hashValues_;            // raw little-endian uint32s
+	std::vector<std::pair<uint32_t, uint32_t>> indexOffsets_;
+	uint32_t numRecords_ = 0;
+	uint32_t lastIobOffset_ = 0;
 };
 
 #pragma pack(push, 1)
@@ -443,11 +535,33 @@ private:
 class ModuleStreamBuilder : public ModWriter
 {
 public:
-	ModuleStreamBuilder(std::string objName, std::string libName)
-	    : objName_(std::move(objName)), libName_(std::move(libName)) {}
+	ModuleStreamBuilder(std::string objName, std::string libName,
+	                    TpiStreamBuilder* tpi)
+	    : objName_(std::move(objName)), libName_(std::move(libName)),
+	      tpi_(tpi) {}
 
 	int addSecContrib(unsigned short, long, long, unsigned long) override { return 1; }
-	int addTypes(unsigned char*, long) override { return 1; }
+	int addTypes(unsigned char* pTypes, long cbTypes) override
+	{
+		// cv2pdb routes every CodeView type record through mod->AddTypes;
+		// in the in-house writer they all flow into the single global TPI
+		// stream that backs every module.  IPI stays empty: cv2pdb has no
+		// LF_FUNC_ID / LF_STRING_ID records to emit.
+		//
+		// cv2pdb prefixes the buffer with a 4-byte CV_SIGNATURE_C13 header
+		// (the leading "\x04\x00\x00\x00" written at userTypes[0..3] in
+		// dwarf2pdb.cpp and at globalTypes[0..3] in cv2pdb.cpp) before any
+		// records start.  Strip it so the record walker does not interpret
+		// the signature as a malformed record.
+		if (!tpi_ || !pTypes || cbTypes <= 0)
+			return 1;
+		size_t off = 0;
+		if (cbTypes >= 4 && pTypes[0] == 0x04
+		    && pTypes[1] == 0 && pTypes[2] == 0 && pTypes[3] == 0)
+			off = 4;
+		tpi_->addRecords(pTypes + off, static_cast<size_t>(cbTypes) - off);
+		return 1;
+	}
 	int addSymbols(unsigned char*, long) override { return 1; }
 	int addPublic(const char*, unsigned short, long, unsigned long) override { return 1; }
 	int addLines(const char*, unsigned short, long, long, long, unsigned short,
@@ -505,6 +619,7 @@ public:
 private:
 	std::string objName_;
 	std::string libName_;
+	TpiStreamBuilder* tpi_;
 };
 
 std::vector<uint8_t> buildSourceInfoSubstream(uint32_t numModules)
@@ -558,7 +673,8 @@ public:
 	{
 		auto* m = new ModuleStreamBuilder(
 		    objName ? std::string(objName) : std::string(),
-		    libName ? std::string(libName) : std::string());
+		    libName ? std::string(libName) : std::string(),
+		    &tpi_);
 		mods_.push_back(m);
 		*outMod = m;
 		return 1;
@@ -587,7 +703,6 @@ public:
 	{
 		MsfBuilder msf;
 
-		TpiStreamBuilder tpi;
 		TpiStreamBuilder ipi;
 		DbiStreamBuilder dbi;
 
@@ -640,10 +755,10 @@ public:
 		const uint16_t kTpiHashIndex = 5;
 		const uint16_t kIpiHashIndex = 6;
 
-		msf.addStream(tpi.buildStream(kTpiHashIndex));   // 2: TPI
+		msf.addStream(tpi_.buildStream(kTpiHashIndex));  // 2: TPI
 		msf.addStream(dbi.buildStream(machine_));        // 3: DBI
 		msf.addStream(ipi.buildStream(kIpiHashIndex));   // 4: IPI
-		msf.addStream(tpi.buildHashStream());            // 5: TPI hash
+		msf.addStream(tpi_.buildHashStream());           // 5: TPI hash
 		msf.addStream(ipi.buildHashStream());            // 6: IPI hash
 		msf.addStream(names_.buildStream());             // 7: /names
 
@@ -663,6 +778,7 @@ private:
 	unsigned short machine_ = 0;
 	std::vector<ModuleStreamBuilder*> mods_;
 	NamesStreamBuilder names_;
+	TpiStreamBuilder tpi_;
 };
 
 }  // namespace
