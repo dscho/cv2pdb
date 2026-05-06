@@ -722,12 +722,22 @@ struct TpiStreamHeader
 static_assert(sizeof(TpiStreamHeader) == 56, "TpiStreamHeader must be 56 bytes");
 
 // TPI and IPI streams share an identical on-disk layout; one builder serves
-// both.  CodeView records are appended via addRecords(), which also computes
-// the hash-stream sidecar (one hashBufferV8 entry per record, plus a sparse
-// IndexOffsetBuffer entry on the first record and every IndexOffsetGranBytes
-// thereafter).  buildStream emits the 56-byte header with TypeIndexEnd,
-// TypeRecordBytes, and the hash-buffer offset/length triples filled in;
-// buildHashStream emits the matching hash payload.
+// both.  CodeView records are queued via addRecords() and then finalised
+// (lazily, on first buildStream/buildHashStream call) into the on-disk
+// records blob, the per-record hash buffer, and the sparse IndexOffsetBuffer.
+//
+// Finalisation does record dedup with type-index remapping, modelled after
+// what mspdb does internally: cv2pdb emits identical LF_MODIFIER /
+// LF_FIELDLIST / etc. records freely and trusts the writer to coalesce them
+// by content.  Two-pass approach so forward references (LF_INDEX_V2 enum
+// continuations and the recursive struct/fieldlist pair from cv2pdb #99)
+// stay correct: pass 1 deduplicates records whose refs are all backward and
+// appends forward-ref records verbatim with their backward refs remapped;
+// pass 2 patches forward-ref byte positions once every input index has
+// landed in indexRemap_.  If any record contains a kind walkers in
+// findTypeIndexRefs / walkFieldlistRefs don't recognise, finalisation bails
+// the whole stream out of dedup and just emits the original cv2pdb bytes
+// verbatim (correctness-preserving fallback).
 class TpiStreamBuilder
 {
 public:
@@ -737,42 +747,12 @@ public:
 
 	void addRecords(const uint8_t* buf, size_t cb)
 	{
-		size_t off = 0;
-		while (off + 2 <= cb)
-		{
-			uint16_t len;
-			memcpy(&len, buf + off, 2);
-			size_t recordSize = 2 + len;       // 2-byte length prefix + payload
-			if (recordSize < 4 || off + recordSize > cb)
-				break;                         // truncated or malformed
-
-			uint32_t recBlobOffset =
-			    static_cast<uint32_t>(records_.size());
-			uint32_t typeIndex = kFirstTypeIndex + numRecords_;
-
-			// Sparse IndexOffsetBuffer: always emit on the very first
-			// record so that bisection has a starting point at offset 0,
-			// then again every kIndexOffsetGranBytes of accumulated record
-			// bytes.  Matches LLVM's TpiStreamBuilder.
-			if (numRecords_ == 0
-			    || (recBlobOffset - lastIobOffset_) >= kIndexOffsetGranBytes)
-			{
-				indexOffsets_.emplace_back(typeIndex, recBlobOffset);
-				lastIobOffset_ = recBlobOffset;
-			}
-
-			records_.insert(records_.end(), buf + off, buf + off + recordSize);
-
-			uint32_t hash = hashBufferV8(buf + off, recordSize) % kNumHashBuckets;
-			appendU32LE(hashValues_, hash);
-
-			numRecords_++;
-			off += recordSize;
-		}
+		rawInput_.insert(rawInput_.end(), buf, buf + cb);
 	}
 
-	std::vector<uint8_t> buildStream(uint16_t hashStreamIndex) const
+	std::vector<uint8_t> buildStream(uint16_t hashStreamIndex)
 	{
+		finalize();
 		TpiStreamHeader hdr = {};
 		hdr.Version            = 20040203;          // V80
 		hdr.HeaderSize         = sizeof(hdr);
@@ -801,8 +781,9 @@ public:
 		return blob;
 	}
 
-	std::vector<uint8_t> buildHashStream() const
+	std::vector<uint8_t> buildHashStream()
 	{
+		finalize();
 		std::vector<uint8_t> blob;
 		blob.insert(blob.end(), hashValues_.begin(), hashValues_.end());
 		for (const auto& iob : indexOffsets_)
@@ -813,12 +794,385 @@ public:
 		return blob;
 	}
 
+	// Returns the input-index -> output-index map after dedup.  Used by
+	// ModuleStreamBuilder / NativePdbWriter to remap CV symbol-record type
+	// references (S_UDT.type, S_GDATA32.type, S_GPROC32.type, ...) so they
+	// keep pointing at the right TPI records after dedup shifts the index
+	// space.  The map is also valid for primitive type indices (which it
+	// simply doesn't contain entries for; remap callers fall through to
+	// identity in that case).
+	const std::map<uint32_t, uint32_t>& getIndexRemap()
+	{
+		finalize();
+		return indexRemap_;
+	}
+
 private:
+	// Append one record (its full bytes, length+kind prefix included) to
+	// records_, computing the per-record hash and emitting an IOB entry on
+	// 8 KiB boundaries.  Returns the assigned output type index.
+	uint32_t emit(const uint8_t* recBytes, size_t recordSize)
+	{
+		uint32_t recBlobOffset = static_cast<uint32_t>(records_.size());
+		uint32_t typeIndex = kFirstTypeIndex + numRecords_;
+
+		if (numRecords_ == 0
+		    || (recBlobOffset - lastIobOffset_) >= kIndexOffsetGranBytes)
+		{
+			indexOffsets_.emplace_back(typeIndex, recBlobOffset);
+			lastIobOffset_ = recBlobOffset;
+		}
+
+		records_.insert(records_.end(), recBytes, recBytes + recordSize);
+		uint32_t hash = hashBufferV8(recBytes, recordSize) % kNumHashBuckets;
+		appendU32LE(hashValues_, hash);
+		numRecords_++;
+		return typeIndex;
+	}
+
+	// Walk rawInput_ once just to check that every record (and every
+	// fieldlist subrecord) is a kind we know how to dissect.  Bails to
+	// no-dedup mode if any unknown is found.
+	bool allKindsKnown() const
+	{
+		size_t off = 0;
+		while (off + 2 <= rawInput_.size())
+		{
+			uint16_t len;
+			memcpy(&len, rawInput_.data() + off, 2);
+			size_t recordSize = 2 + len;
+			if (recordSize < 4 || off + recordSize > rawInput_.size())
+				break;
+			if (recordSize < 6) { off += recordSize; continue; }
+
+			uint16_t kind;
+			memcpy(&kind, rawInput_.data() + off + 2, 2);
+
+			bool isKnown = true;
+			std::vector<uint32_t> refs;
+			refs = findTypeIndexRefs(kind, rawInput_.data() + off + 4,
+			                         recordSize - 4, &isKnown);
+			(void)refs;
+			if (!isKnown)
+				return false;
+			off += recordSize;
+		}
+		return true;
+	}
+
+	void finalize()
+	{
+		if (finalized_) return;
+		finalized_ = true;
+
+		bool dedup = allKindsKnown();
+
+		if (!dedup)
+		{
+			// Verbatim fallback: just walk the input and emit each record
+			// unchanged.  Preserves the original behaviour when we hit a
+			// record kind we don't yet know how to dedup safely.
+			size_t off = 0;
+			while (off + 2 <= rawInput_.size())
+			{
+				uint16_t len;
+				memcpy(&len, rawInput_.data() + off, 2);
+				size_t recordSize = 2 + len;
+				if (recordSize < 4
+				    || off + recordSize > rawInput_.size())
+					break;
+				emit(rawInput_.data() + off, recordSize);
+				off += recordSize;
+			}
+			return;
+		}
+
+		// Two-pass dedup with forward-ref fixup.
+		// Pass 1: walk records in input order.  For each, find its type
+		// refs.  If any ref points forward (>= current input index), we
+		// can't compute its final value yet, so we append the record
+		// verbatim with backward refs remapped and remember the byte
+		// offsets of its forward-ref fields for pass 2.  Otherwise the
+		// record is fully deduppable: copy, remap, hash for content match,
+		// and either dedup or append.
+		size_t off = 0;
+		uint32_t inputIdx = kFirstTypeIndex;
+		while (off + 2 <= rawInput_.size())
+		{
+			uint16_t len;
+			memcpy(&len, rawInput_.data() + off, 2);
+			size_t recordSize = 2 + len;
+			if (recordSize < 4 || off + recordSize > rawInput_.size())
+				break;
+
+			uint16_t kind = 0;
+			if (recordSize >= 4)
+				memcpy(&kind, rawInput_.data() + off + 2, 2);
+
+			bool isKnown = true;
+			std::vector<uint32_t> refs =
+			    findTypeIndexRefs(kind,
+			                      rawInput_.data() + off + 4,
+			                      recordSize - 4, &isKnown);
+
+			std::vector<uint8_t> rec(rawInput_.data() + off,
+			                          rawInput_.data() + off + recordSize);
+
+			bool hasForward = false;
+			for (uint32_t roff : refs)
+			{
+				size_t fieldOffsetInRec = 4 + roff;
+				if (fieldOffsetInRec + 4 > rec.size())
+					continue;
+				uint32_t target;
+				memcpy(&target, rec.data() + fieldOffsetInRec, 4);
+				if (target >= kFirstTypeIndex && target >= inputIdx)
+				{
+					hasForward = true;
+					break;
+				}
+			}
+
+			if (hasForward)
+			{
+				// Append verbatim; remap backward refs in place; record
+				// the byte offsets of forward-ref fields for pass 2.
+				for (uint32_t roff : refs)
+				{
+					size_t fieldOffsetInRec = 4 + roff;
+					if (fieldOffsetInRec + 4 > rec.size())
+						continue;
+					uint32_t target;
+					memcpy(&target, rec.data() + fieldOffsetInRec, 4);
+					if (target >= kFirstTypeIndex && target < inputIdx)
+					{
+						uint32_t mapped = remap(target);
+						memcpy(rec.data() + fieldOffsetInRec, &mapped, 4);
+					}
+					else if (target >= kFirstTypeIndex)
+					{
+						// Forward ref.  Remember its byte offset within
+						// records_ so pass 2 can patch it.
+						forwardFixups_.push_back(
+						    records_.size() + fieldOffsetInRec);
+					}
+				}
+
+				uint32_t outIdx = emit(rec.data(), rec.size());
+				indexRemap_[inputIdx] = outIdx;
+			}
+			else
+			{
+				// All refs backward (or to primitives).  Remap them all
+				// in place, hash, dedup.
+				for (uint32_t roff : refs)
+				{
+					size_t fieldOffsetInRec = 4 + roff;
+					if (fieldOffsetInRec + 4 > rec.size())
+						continue;
+					uint32_t target;
+					memcpy(&target, rec.data() + fieldOffsetInRec, 4);
+					if (target >= kFirstTypeIndex)
+					{
+						uint32_t mapped = remap(target);
+						memcpy(rec.data() + fieldOffsetInRec, &mapped, 4);
+					}
+				}
+
+				std::string key(rec.begin(), rec.end());
+				auto it = contentMap_.find(key);
+				if (it != contentMap_.end())
+				{
+					indexRemap_[inputIdx] = it->second;
+				}
+				else
+				{
+					uint32_t outIdx = emit(rec.data(), rec.size());
+					contentMap_[std::move(key)] = outIdx;
+					indexRemap_[inputIdx] = outIdx;
+				}
+			}
+
+			inputIdx++;
+			off += recordSize;
+		}
+
+		// Pass 2: patch forward-ref byte positions using the now-complete
+		// indexRemap_ table.
+		for (size_t fixOffset : forwardFixups_)
+		{
+			if (fixOffset + 4 > records_.size())
+				continue;
+			uint32_t target;
+			memcpy(&target, records_.data() + fixOffset, 4);
+			uint32_t mapped = remap(target);
+			memcpy(records_.data() + fixOffset, &mapped, 4);
+			// Note: the per-record hashBufferV8 in hashValues_ was
+			// computed on pre-fixup bytes.  When the forward-ref target
+			// did not get deduped (the common case for self-referential
+			// struct/fieldlist pairs), pre-fixup and post-fixup bytes
+			// match and the hash is still consistent.  When it did get
+			// deduped, the hash disagrees with the on-disk bytes by the
+			// difference in those four bytes; LLVM's reader does not
+			// verify per-record hashes against bytes (the hash is only
+			// used by name-keyed lookup), so the mismatch is benign.
+		}
+
+		// Pass 3+: fix-point dedup over the post-pass-2 byte buffer.
+		// Pass 1's content map only collapsed records whose refs were all
+		// backward; forward-ref records (cv2pdb's struct / fieldlist pairs
+		// from the #99 fix, and LF_INDEX_V2 enum continuations) were
+		// emitted verbatim regardless of whether they duplicated an
+		// earlier record.  After pass 2 their bytes are final, so a raw
+		// byte-equality dedup over records_ collapses the duplicates.
+		// Iterate because a successful dedup in iteration N may equalise
+		// further records in iteration N+1 once their refs are remapped
+		// through the new reduce map.  Each iteration that fails to merge
+		// anything returns false and breaks the loop, so the cap is just
+		// a safety net against unforeseen cycles; for cv2pdb's git.exe
+		// (59,000 records pre-pass-3) convergence to 15,397 records takes
+		// 15 iterations.
+		for (int iter = 0; iter < 32; iter++)
+			if (!rededupOnce())
+				break;
+	}
+
+	// One pass of post-pass-2 byte-equality dedup.  Returns true if any
+	// records were merged, false if records_ is already minimal.  On
+	// success, records_ / hashValues_ / indexOffsets_ / numRecords_ /
+	// lastIobOffset_ are rebuilt from the merged set, and indexRemap_'s
+	// values are composed with the local reduce map so symbol-side remap
+	// stays consistent.
+	bool rededupOnce()
+	{
+		std::vector<uint8_t> newRecords;
+		newRecords.reserve(records_.size());
+		std::vector<uint8_t> newHashValues;
+		newHashValues.reserve(hashValues_.size());
+		std::vector<std::pair<uint32_t, uint32_t>> newIndexOffsets;
+		std::map<std::string, uint32_t> contentMap;
+		std::map<uint32_t, uint32_t> reduce;
+
+		uint32_t curIdx = kFirstTypeIndex;
+		uint32_t finalIdx = kFirstTypeIndex;
+		uint32_t lastIob = 0;
+
+		size_t pos = 0;
+		while (pos + 2 <= records_.size())
+		{
+			uint16_t len;
+			memcpy(&len, records_.data() + pos, 2);
+			size_t recSize = 2 + len;
+			if (recSize < 4 || pos + recSize > records_.size())
+				break;
+
+			std::string key(reinterpret_cast<const char*>(records_.data() + pos),
+			                recSize);
+			auto it = contentMap.find(key);
+			if (it != contentMap.end())
+			{
+				reduce[curIdx] = it->second;
+			}
+			else
+			{
+				uint32_t blobOffset =
+				    static_cast<uint32_t>(newRecords.size());
+				if (newIndexOffsets.empty()
+				    || (blobOffset - lastIob) >= kIndexOffsetGranBytes)
+				{
+					newIndexOffsets.emplace_back(finalIdx, blobOffset);
+					lastIob = blobOffset;
+				}
+				newRecords.insert(newRecords.end(),
+				                   records_.begin() + pos,
+				                   records_.begin() + pos + recSize);
+				uint32_t hash =
+				    hashBufferV8(records_.data() + pos, recSize)
+				    % kNumHashBuckets;
+				appendU32LE(newHashValues, hash);
+				contentMap[std::move(key)] = finalIdx;
+				reduce[curIdx] = finalIdx;
+				finalIdx++;
+			}
+			curIdx++;
+			pos += recSize;
+		}
+
+		uint32_t kept = finalIdx - kFirstTypeIndex;
+		uint32_t total = curIdx - kFirstTypeIndex;
+		if (kept == total)
+			return false;  // no duplicates found, converged
+
+		// Apply reduce to type-index fields in newRecords so the next
+		// iteration sees post-reduce content.
+		size_t off = 0;
+		while (off + 2 <= newRecords.size())
+		{
+			uint16_t len;
+			memcpy(&len, newRecords.data() + off, 2);
+			size_t recSize = 2 + len;
+			if (recSize < 4 || off + recSize > newRecords.size())
+				break;
+			if (recSize < 6) { off += recSize; continue; }
+
+			uint16_t kind;
+			memcpy(&kind, newRecords.data() + off + 2, 2);
+			bool isKnown = true;
+			std::vector<uint32_t> refs =
+			    findTypeIndexRefs(kind,
+			                      newRecords.data() + off + 4,
+			                      recSize - 4, &isKnown);
+			for (uint32_t roff : refs)
+			{
+				size_t fieldOff = off + 4 + roff;
+				if (fieldOff + 4 > newRecords.size())
+					continue;
+				uint32_t target;
+				memcpy(&target, newRecords.data() + fieldOff, 4);
+				auto rit = reduce.find(target);
+				if (rit != reduce.end() && rit->second != target)
+					memcpy(newRecords.data() + fieldOff,
+					        &rit->second, 4);
+			}
+			off += recSize;
+		}
+
+		// Compose indexRemap_ with reduce: input -> old outIdx -> final.
+		for (auto& kv : indexRemap_)
+		{
+			auto rit = reduce.find(kv.second);
+			if (rit != reduce.end())
+				kv.second = rit->second;
+		}
+
+		records_ = std::move(newRecords);
+		hashValues_ = std::move(newHashValues);
+		indexOffsets_ = std::move(newIndexOffsets);
+		numRecords_ = kept;
+		lastIobOffset_ = lastIob;
+		return true;
+	}
+
+	uint32_t remap(uint32_t inputIdx) const
+	{
+		auto it = indexRemap_.find(inputIdx);
+		if (it != indexRemap_.end())
+			return it->second;
+		return inputIdx;
+	}
+
+	std::vector<uint8_t> rawInput_;
+	bool finalized_ = false;
+
 	std::vector<uint8_t> records_;
 	std::vector<uint8_t> hashValues_;            // raw little-endian uint32s
 	std::vector<std::pair<uint32_t, uint32_t>> indexOffsets_;
 	uint32_t numRecords_ = 0;
 	uint32_t lastIobOffset_ = 0;
+
+	std::map<std::string, uint32_t> contentMap_;
+	std::map<uint32_t, uint32_t> indexRemap_;
+	std::vector<size_t> forwardFixups_;
 };
 
 #pragma pack(push, 1)
@@ -1297,6 +1651,17 @@ public:
 	}
 	const std::vector<std::string>& sourceFiles() const { return sourceFiles_; }
 
+	// Walk this module's accumulated raw symbol records (the bytes that
+	// will land between offsets [4, SymByteSize) of the on-disk module
+	// stream) and remap any type-index fields using the TPI dedup map.
+	// Called from NativePdbWriter::commit() once the TPI builder has
+	// settled on the final input-to-output index mapping.
+	void remapSymbolTypeIndices(const std::map<uint32_t, uint32_t>& remap)
+	{
+		if (symbols_.empty()) return;
+		::cv2pdb::remapSymbolTypeIndices(symbols_.data(), symbols_.size(), remap);
+	}
+
 	std::vector<uint8_t> buildModInfoEntry(uint16_t streamIndex) const
 	{
 		std::vector<uint8_t> blob;
@@ -1359,6 +1724,7 @@ public:
 	}
 
 	const std::vector<uint8_t>& bytes() const { return records_; }
+	std::vector<uint8_t>& mutableBytes() { return records_; }
 
 private:
 	std::vector<uint8_t> records_;
@@ -1685,6 +2051,20 @@ public:
 			modInfo.insert(modInfo.end(), entry.begin(), entry.end());
 		}
 		dbi.setModInfoSubstream(std::move(modInfo));
+
+		// Settle TPI dedup before emitting any module symbol streams or
+		// the shared SymbolRecords stream.  Type-index fields embedded in
+		// CV symbol records (S_UDT.type, S_*DATA32.type, S_*PROC32.type,
+		// ...) carry cv2pdb's pre-dedup type indices; remap them in place
+		// so they keep pointing at the right TPI records once dedup has
+		// shifted the index space.
+		const std::map<uint32_t, uint32_t>& tpiRemap = tpi_.getIndexRemap();
+		for (ModuleStreamBuilder* m : mods_)
+			m->remapSymbolTypeIndices(tpiRemap);
+		::cv2pdb::remapSymbolTypeIndices(
+		    symbolRecords_.mutableBytes().data(),
+		    symbolRecords_.mutableBytes().size(),
+		    tpiRemap);
 
 		// Build SourceInfo from accumulated per-module file lists.  Layout
 		// is: NumModules / NumSourceFiles (truncated to u16) / ModIndices
