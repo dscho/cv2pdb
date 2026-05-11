@@ -1662,6 +1662,139 @@ public:
 		::cv2pdb::remapSymbolTypeIndices(symbols_.data(), symbols_.size(), remap);
 	}
 
+	// Patch each scope-opening record's `parent` and `end` (and, where
+	// the record type carries one, `next`) field so dbghelp.dll can walk
+	// the symbol stream as a tree.  cv2pdb's DWARF translator emits
+	// S_GPROC32 / S_LPROC32 / S_BLOCK32 records with these three fields
+	// zeroed because mspdb's mod->AddSymbols populates them on the way
+	// in; the in-house writer skips that path, so we have to do the same
+	// fix-up here once all the records are accumulated.  Without it,
+	// dbghelp reports the module as `(pdb symbols)` (public-only) rather
+	// than `(private pdb symbols)` and refuses to surface function-local
+	// variables, source line info, or scope-aware stepping.
+	//
+	// Layout per microsoft-pdb cvinfo.h (CV_PROCSYM32, BLOCKSYM32,
+	// THUNKSYM32, INLINESITESYM):
+	//   S_GPROC32 / S_LPROC32 / S_GPROC32_ID / S_LPROC32_ID: parent(4),
+	//     end(4), next(4) at payload offsets 0/4/8.
+	//   S_BLOCK32: parent(4), end(4), len(4) at payload offsets 0/4/8.
+	//     No `next` slot (sibling chaining is implicit in the linear
+	//     scope-end terminator).
+	//   S_THUNK32: parent(4), end(4), next(4) at payload offsets 0/4/8.
+	//   S_INLINESITE: parent(4), end(4) at payload offsets 0/4.  No
+	//     `next` slot here either.
+	// Terminators:
+	//   S_END (0x0006) closes GPROC32 / LPROC32 / BLOCK32 / THUNK32.
+	//   S_PROC_ID_END (0x114F) closes GPROC32_ID / LPROC32_ID.
+	//   S_INLINESITE_END (0x114E) closes S_INLINESITE.
+	// All offsets are absolute byte positions within the FULL module
+	// stream including the leading 4-byte CV_SIGNATURE_C13 prefix; that
+	// is what dbghelp expects and what mspdb writes.
+	void fixupSymbolScopes()
+	{
+		if (symbols_.empty()) return;
+
+		struct Scope { size_t openerOffset; uint16_t kind; };
+		std::vector<Scope> stack;
+		size_t off = 0;
+		bool corrupt = false;
+		while (off + 2 <= symbols_.size())
+		{
+			uint16_t len;
+			memcpy(&len, symbols_.data() + off, 2);
+			size_t recordSize = 2 + len;
+			if (recordSize < 4 || off + recordSize > symbols_.size())
+			{
+				corrupt = true;
+				break;
+			}
+			uint16_t kind;
+			memcpy(&kind, symbols_.data() + off + 2, 2);
+
+			size_t streamOff = 4 + off;  // include CV_SIGNATURE_C13
+
+			bool opensScope = false;
+			bool closesScope = false;
+			uint16_t expectedTerminator = 0;
+			switch (kind)
+			{
+			case 0x1110: // S_GPROC32
+			case 0x110F: // S_LPROC32
+				opensScope = true;
+				expectedTerminator = 0x0006; // S_END
+				break;
+			case 0x1148: // S_GPROC32_ID
+			case 0x1147: // S_LPROC32_ID
+				opensScope = true;
+				expectedTerminator = 0x114F; // S_PROC_ID_END
+				break;
+			case 0x1103: // S_BLOCK32
+			case 0x1102: // S_THUNK32
+				opensScope = true;
+				expectedTerminator = 0x0006; // S_END
+				break;
+			case 0x1132: // S_SEPCODE
+				// SEPCODESYM layout (cvinfo.h): pParent(4) + pEnd(4) +
+				// length(4) + scf(4) + off(4) + offParent(4) + sect(2)
+				// + sectParent(2). Parent and End sit at payload
+				// offsets 0 / 4, same as BLOCK32 / INLINESITE, so the
+				// generic patch-end-at-openerLocal+8 path covers it.
+				// Closed by S_END.  Without this case the closing
+				// S_END pops an empty stack, triggers corrupt=true,
+				// and every record after split-out cold code in the
+				// module loses its End pointer.
+				opensScope = true;
+				expectedTerminator = 0x0006; // S_END
+				break;
+			case 0x114D: // S_INLINESITE
+				opensScope = true;
+				expectedTerminator = 0x114E; // S_INLINESITE_END
+				break;
+			case 0x0006: // S_END
+			case 0x114E: // S_INLINESITE_END
+			case 0x114F: // S_PROC_ID_END
+				closesScope = true;
+				break;
+			}
+
+			if (opensScope)
+			{
+				uint32_t parentOff = stack.empty()
+				    ? 0u
+				    : static_cast<uint32_t>(stack.back().openerOffset);
+				if (recordSize >= 8)
+					memcpy(symbols_.data() + off + 4, &parentOff, 4);
+				stack.push_back({streamOff, kind});
+				(void)expectedTerminator;
+			}
+			else if (closesScope)
+			{
+				if (stack.empty())
+				{
+					corrupt = true;
+					break;
+				}
+				Scope opened = stack.back();
+				stack.pop_back();
+				uint32_t endOff = static_cast<uint32_t>(streamOff);
+				size_t openerLocal = opened.openerOffset - 4;
+				if (openerLocal + 12 <= symbols_.size())
+					memcpy(symbols_.data() + openerLocal + 8, &endOff, 4);
+			}
+
+			off += recordSize;
+		}
+
+		if (corrupt || !stack.empty())
+		{
+			// Either the buffer is malformed or there are unbalanced
+			// open scopes (a producer that forgot to emit S_END).  Don't
+			// rewrite anything in that case; leaving the records intact
+			// matches the verbatim fallback we use elsewhere.
+			return;
+		}
+	}
+
 	std::vector<uint8_t> buildModInfoEntry(uint16_t streamIndex) const
 	{
 		std::vector<uint8_t> blob;
@@ -2060,7 +2193,10 @@ public:
 		// shifted the index space.
 		const std::map<uint32_t, uint32_t>& tpiRemap = tpi_.getIndexRemap();
 		for (ModuleStreamBuilder* m : mods_)
+		{
 			m->remapSymbolTypeIndices(tpiRemap);
+			m->fixupSymbolScopes();
+		}
 		::cv2pdb::remapSymbolTypeIndices(
 		    symbolRecords_.mutableBytes().data(),
 		    symbolRecords_.mutableBytes().size(),
