@@ -1766,6 +1766,34 @@ public:
 					memcpy(symbols_.data() + off + 4, &parentOff, 4);
 				stack.push_back({streamOff, kind});
 				(void)expectedTerminator;
+
+				// Procedure records get a Globals-stream S_PROCREF /
+				// S_LPROCREF entry; collect (name, ibSym, isLocal) so
+				// the writer can synthesize those refs after every
+				// module's symbols are finalised.  Per cvinfo.h the
+				// V3-style name field starts 39 bytes into the record:
+				// len(2)+id(2)+pparent(4)+pend(4)+next(4)+proc_len(4)+
+				// debug_start(4)+debug_end(4)+proctype(4)+offset(4)+
+				// segment(2)+flags(1), null-terminated.  Top-level
+				// procs only -- a nested S_INLINESITE / S_BLOCK32 does
+				// not get its own global ref.
+				const size_t kNameOffset = 39;
+				if ((kind == 0x1110 || kind == 0x110F)
+				    && stack.size() == 1
+				    && off + kNameOffset < symbols_.size())
+				{
+					const char* p = reinterpret_cast<const char*>(
+					    symbols_.data() + off + kNameOffset);
+					size_t maxLen = symbols_.size() - off - kNameOffset;
+					size_t nlen = strnlen(p, maxLen);
+					if (nlen > 0 && nlen < maxLen)
+					{
+						ProcRef ref{std::string(p, nlen),
+						            static_cast<uint32_t>(streamOff),
+						            kind == 0x110F};
+						moduleProcs_.push_back(std::move(ref));
+					}
+				}
 			}
 			else if (closesScope)
 			{
@@ -1823,6 +1851,19 @@ public:
 		return blob;
 	}
 
+	// Procedure-style entries collected by fixupSymbolScopes, exposed so
+	// NativePdbWriter::commit() can synthesize the matching S_PROCREF /
+	// S_LPROCREF Globals-stream records.  ibSym is the byte offset of
+	// the S_GPROC32 / S_LPROC32 record within this module's on-disk
+	// symbol stream (with the leading CV_SIGNATURE_C13 prefix counted).
+	struct ProcRef
+	{
+		std::string name;
+		uint32_t    ibSym;
+		bool        isLocal;
+	};
+	const std::vector<ProcRef>& moduleProcs() const { return moduleProcs_; }
+
 private:
 	std::string objName_;
 	std::string libName_;
@@ -1838,6 +1879,7 @@ private:
 	std::vector<std::string> sourceFiles_;
 	SectionContribEntry primaryContrib_;
 	bool hasPrimary_ = false;
+	std::vector<ProcRef> moduleProcs_;
 };
 
 // Append-only buffer of CV symbol records that the Globals and Publics
@@ -2201,6 +2243,47 @@ public:
 		    symbolRecords_.mutableBytes().data(),
 		    symbolRecords_.mutableBytes().size(),
 		    tpiRemap);
+
+		// Synthesize a Globals-stream entry per top-level procedure in
+		// every module: each S_GPROC32 / S_LPROC32 record gets a matching
+		// S_PROCREF (rectyp 0x1125) / S_LPROCREF (0x1127) in the shared
+		// SymbolRecords stream, indexed in the Globals GSI hash so
+		// dbghelp.dll's "name -> module" dispatch is populated.  Without
+		// these entries the resulting PDB loads as `(pdb symbols)`
+		// (public-only) rather than `(private pdb symbols)` because
+		// dbghelp has no way to find the module hosting any given
+		// function name beyond the bare-bones S_PUB32 records that
+		// addPublic builds.  Layout per microsoft-pdb cvinfo.h REFSYM2:
+		// sumName(4) + ibSym(4, byte offset of the S_GPROC32 within the
+		// owning module stream) + imod(2, 1-based module index) + name
+		// (null-terminated).  sumName is the name's SUC checksum;
+		// real-world readers (LLVM, dbghelp) ignore mismatches there, so
+		// emit 0 to match cv2pdb-mspdb's behaviour.
+		for (size_t mi = 0; mi < mods_.size(); mi++)
+		{
+			uint16_t imod = static_cast<uint16_t>(mi + 1);
+			for (const auto& ref : mods_[mi]->moduleProcs())
+			{
+				std::vector<uint8_t> record;
+				record.push_back(0);
+				record.push_back(0);
+				appendU16LE(record, ref.isLocal ? 0x1127 : 0x1125);
+				appendU32LE(record, 0);                  // sumName
+				appendU32LE(record, ref.ibSym);
+				appendU16LE(record, imod);
+				record.insert(record.end(), ref.name.begin(), ref.name.end());
+				record.push_back(0);                     // null terminator
+				while (record.size() % 4 != 0)
+					record.push_back(0);
+				uint16_t lenField =
+				    static_cast<uint16_t>(record.size() - 2);
+				record[0] = static_cast<uint8_t>(lenField & 0xFF);
+				record[1] = static_cast<uint8_t>((lenField >> 8) & 0xFF);
+
+				uint32_t recOff = symbolRecords_.append(record);
+				globals_.addGlobalEntry(ref.name, recOff);
+			}
+		}
 
 		// Build SourceInfo from accumulated per-module file lists.  Layout
 		// is: NumModules / NumSourceFiles (truncated to u16) / ModIndices
