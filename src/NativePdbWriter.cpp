@@ -32,6 +32,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1809,6 +1810,33 @@ public:
 				if (openerLocal + 12 <= symbols_.size())
 					memcpy(symbols_.data() + openerLocal + 8, &endOff, 4);
 			}
+			else if (kind == 0x1108)
+			{
+				// S_UDT_V3: len(2)+id(2)+type(4)+name(null-term).
+				// Collect (name, full record bytes) so the writer can
+				// mirror each UDT into the shared SymbolRecords stream
+				// and register it in the Globals GSI hash; dbghelp's
+				// `dt <module>!<typename>` resolves type-by-name by
+				// scanning that hash for an S_UDT entry, then derefs
+				// the embedded TPI type index.
+				const size_t kUdtNameOff = 8;
+				if (off + kUdtNameOff < symbols_.size())
+				{
+					const char* np = reinterpret_cast<const char*>(
+					    symbols_.data() + off + kUdtNameOff);
+					size_t maxLen = symbols_.size() - off - kUdtNameOff;
+					size_t nlen = strnlen(np, maxLen);
+					if (nlen > 0 && nlen < maxLen)
+					{
+						UdtRef ref;
+						ref.name.assign(np, nlen);
+						ref.recordBytes.assign(
+						    symbols_.data() + off,
+						    symbols_.data() + off + recordSize);
+						moduleUdts_.push_back(std::move(ref));
+					}
+				}
+			}
 
 			off += recordSize;
 		}
@@ -1864,6 +1892,19 @@ public:
 	};
 	const std::vector<ProcRef>& moduleProcs() const { return moduleProcs_; }
 
+	// User-defined-type entries: dbghelp resolves `dt <module>!<name>`
+	// by looking up an S_UDT-named entry in the Globals GSI hash, so
+	// every UDT cv2pdb emits into a module symbol stream is mirrored
+	// into the shared SymbolRecords stream too.  The bytes here are
+	// the raw S_UDT record copied verbatim (length-prefix and all)
+	// from the module stream.
+	struct UdtRef
+	{
+		std::string          name;
+		std::vector<uint8_t> recordBytes;
+	};
+	const std::vector<UdtRef>& moduleUdts() const { return moduleUdts_; }
+
 private:
 	std::string objName_;
 	std::string libName_;
@@ -1880,6 +1921,7 @@ private:
 	SectionContribEntry primaryContrib_;
 	bool hasPrimary_ = false;
 	std::vector<ProcRef> moduleProcs_;
+	std::vector<UdtRef> moduleUdts_;
 };
 
 // Append-only buffer of CV symbol records that the Globals and Publics
@@ -2283,6 +2325,21 @@ public:
 				uint32_t recOff = symbolRecords_.append(record);
 				globals_.addGlobalEntry(ref.name, recOff);
 			}
+
+			// Mirror each S_UDT_V3 record collected from the module
+			// into the shared SymbolRecords stream and the Globals
+			// hash so `dt <module>!<typename>` can resolve the name.
+			// Dedup by name across all modules: only the first
+			// occurrence of a given typedef-name is emitted as a
+			// global, matching cv2pdb-mspdb's behaviour (it keeps
+			// per-name uniqueness in the cross-module UDT table).
+			for (const auto& udt : mods_[mi]->moduleUdts())
+			{
+				if (!globalUdtNames_.insert(udt.name).second)
+					continue;
+				uint32_t recOff = symbolRecords_.append(udt.recordBytes);
+				globals_.addGlobalEntry(udt.name, recOff);
+			}
 		}
 
 		// Build SourceInfo from accumulated per-module file lists.  Layout
@@ -2419,6 +2476,7 @@ private:
 	GsiStreamBuilder globals_;
 	GsiStreamBuilder publics_;
 	std::vector<uint8_t> sectionHeaders_;
+	std::set<std::string> globalUdtNames_;
 };
 
 }  // namespace
