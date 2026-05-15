@@ -208,7 +208,9 @@ int T_main(int argc, TCHAR* argv[])
 		else if (argv[0][1] == 'e')
 			useTypedefEnum = true;
 		else if (argv[0][1] == 'N')
-			useNativePdbWriter = true;
+			useNativePdbWriter = true;  // no-op: native is now the default
+		else if (argv[0][1] == 'M')
+			useNativePdbWriter = false; // fall back to mspdb*.dll writer
 		else if (!T_strncmp(&argv[0][1], TEXT("debug"), 5)) // debug[level]
 		{
 			debug = (DebugLevel)T_strtoul(&argv[0][6], 0, 0);
@@ -236,7 +238,7 @@ int T_main(int argc, TCHAR* argv[])
 		printf("License for redistribution is given by the Artistic License 2.0\n");
 		printf("see file LICENSE for further details\n");
 		printf("\n");
-		printf("usage: " SARG " [-D<version>|-C|-n|-N|-e|-s<C>|-p<embedded-pdb>|-l<debug-link>] <exe-file> [new-exe-file] [pdb-file]\n", argv[0]);
+		printf("usage: " SARG " [-D<version>|-C|-n|-N|-M|-e|-s<C>|-p<embedded-pdb>|-l<debug-link>] <exe-file> [new-exe-file] [pdb-file]\n", argv[0]);
 		return -1;
 	}
 

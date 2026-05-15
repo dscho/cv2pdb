@@ -57,16 +57,16 @@ jobs:
           EOF
 
           gcc -g -o hello.exe hello.c &&
-          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe hello.exe world.exe &&
-          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe -N hello.exe world-native.exe &&
+          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe -M hello.exe world-mspdb.exe &&
+          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe    hello.exe world.exe &&
 
           ls -l hello* world* &&
 
           curl -Lo cvdump.exe https://raw.githubusercontent.com/microsoft/microsoft-pdb/HEAD/cvdump/cvdump.exe &&
           ./cvdump.exe world.pdb >world.cvdump &&
-          ./cvdump.exe world-native.pdb >world-native.cvdump &&
+          ./cvdump.exe world-mspdb.pdb >world-mspdb.cvdump &&
           grep '^S_PUB32: .*, Flags: 00000000, main$' world.cvdump &&
-          grep '^S_PUB32: .*, Flags: 00000000, main$' world-native.cvdump
+          grep '^S_PUB32: .*, Flags: 00000000, main$' world-mspdb.cvdump
       - name: verify split functions
         shell: bash
         run: |
@@ -81,13 +81,13 @@ jobs:
           EOF
 
           gcc -g -O2 -shared -o split-dwarf.dll split.c &&
-          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe split-dwarf.dll split-cv.dll &&
-          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe -N split-dwarf.dll split-cv-native.dll &&
+          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe -M split-dwarf.dll split-cv-mspdb.dll &&
+          bin/${{env.BUILD_CONFIGURATION}}*/cv2pdb.exe    split-dwarf.dll split-cv.dll &&
 
           ls -l split-dwarf* split-cv* &&
 
           curl -Lo cvdump.exe https://raw.githubusercontent.com/microsoft/microsoft-pdb/HEAD/cvdump/cvdump.exe &&
           ./cvdump.exe split-cv.pdb > split-cv.dump &&
-          ./cvdump.exe split-cv-native.pdb > split-cv-native.dump &&
+          ./cvdump.exe split-cv-mspdb.pdb > split-cv-mspdb.dump &&
           awk '$2 == "S_GPROC32:" && $NF == "split_func" { scope=gensub(/,/,"",1,$3); } $2 == "S_SEPCODE:" { getline; if ($4 == scope) found=1; } END {exit !found; }' split-cv.dump &&
-          awk '$2 == "S_GPROC32:" && $NF == "split_func" { scope=gensub(/,/,"",1,$3); } $2 == "S_SEPCODE:" { getline; if ($4 == scope) found=1; } END {exit !found; }' split-cv-native.dump
+          awk '$2 == "S_GPROC32:" && $NF == "split_func" { scope=gensub(/,/,"",1,$3); } $2 == "S_SEPCODE:" { getline; if ($4 == scope) found=1; } END {exit !found; }' split-cv-mspdb.dump

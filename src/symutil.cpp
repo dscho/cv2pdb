@@ -18,7 +18,12 @@ extern "C" {
 char dotReplacementChar = '@';
 bool demangleSymbols = true;
 bool useTypedefEnum = false;
-bool useNativePdbWriter = false;
+// Default backend: the in-house native PDB writer.  Set to false by
+// `-M` to fall back to the mspdb*.dll-based writer (kept for users
+// who need byte-for-byte compatibility with older cv2pdb output, or
+// who hit a regression in the native writer).  The `-N` flag is now
+// a no-op (kept so old invocations continue to work).
+bool useNativePdbWriter = true;
 
 int dsym2c(const BYTE* p, int len, char* cname, int maxclen)
 {
