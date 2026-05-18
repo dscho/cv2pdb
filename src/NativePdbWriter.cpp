@@ -1236,6 +1236,19 @@ public:
 		sectionContribs_ = std::move(entries);
 	}
 
+	// Replace the default empty SectionMap with a pre-built one.  The
+	// substream's layout is a 4-byte header (Count, LogCount) followed
+	// by 20-byte SectionMapEntry records.  Without populated entries,
+	// dbghelp.dll cannot translate the segment-relative addresses in
+	// S_GPROC32 / DEBUG_S_LINES records into file-section coordinates
+	// and SymGetLineFromAddr64 silently returns no result; the cdb
+	// `ln <module>!<symbol>` and `bl` commands stop printing source
+	// file:line information without this substream.
+	void setSectionMapSubstream(std::vector<uint8_t> bytes)
+	{
+		sectionMap_ = std::move(bytes);
+	}
+
 	void setGlobalSymbolStreamIndex(uint16_t idx) { globalSymStream_ = idx; }
 	void setPublicSymbolStreamIndex(uint16_t idx) { publicSymStream_ = idx; }
 	void setSymRecordStreamIndex(uint16_t idx)    { symRecordStream_ = idx; }
@@ -1254,9 +1267,11 @@ public:
 			secContrib.insert(secContrib.end(), p, p + sizeof(e));
 		}
 
-		std::vector<uint8_t> secMap;
-		appendU16LE(secMap, 0);              // Count
-		appendU16LE(secMap, 0);              // LogCount
+		std::vector<uint8_t> defaultSecMap;
+		appendU16LE(defaultSecMap, 0);              // Count
+		appendU16LE(defaultSecMap, 0);              // LogCount
+		const std::vector<uint8_t>& secMap =
+		    sectionMap_.empty() ? defaultSecMap : sectionMap_;
 
 		std::vector<uint8_t> defaultSourceInfo;
 		appendU16LE(defaultSourceInfo, 0);   // NumModules
@@ -1337,6 +1352,7 @@ public:
 private:
 	std::vector<uint8_t> modInfo_;
 	std::vector<uint8_t> sourceInfo_;
+	std::vector<uint8_t> sectionMap_;
 	std::vector<SectionContribEntry> sectionContribs_;
 	uint16_t globalSymStream_ = 0xFFFF;
 	uint16_t publicSymStream_ = 0xFFFF;
@@ -1392,13 +1408,29 @@ public:
 
 		if (!hasPrimary_)
 		{
+			// cv2pdb's first addSecContrib call per module covers the
+			// whole .text section -- the "primary contribution" stored
+			// inline in the ModInfo entry's SectionContrib field.  mspdb
+			// mirrors it into the global SectionContribs substream too,
+			// but at the END, after all the per-function contribs that
+			// follow.  Stash primary now and skip the global push; the
+			// commit-time loop appends primaries to the global list
+			// after every other module has supplied its per-function
+			// entries.
 			primaryContrib_ = e;
 			hasPrimary_ = true;
+			return 1;
 		}
 		if (allSecContribs_)
 			allSecContribs_->push_back(e);
 		return 1;
 	}
+
+	// Read accessors used by NativePdbWriter::commit() to append the
+	// primary contribution to the global SectionContribs list after the
+	// per-function entries are in place (matching mspdb's emission).
+	bool hasPrimaryContrib() const { return hasPrimary_; }
+	const SectionContribEntry& primaryContrib() const { return primaryContrib_; }
 
 	int addTypes(unsigned char* pTypes, long cbTypes) override
 	{
@@ -1619,16 +1651,19 @@ public:
 		appendU32LE(blob, 4);   // CV_SIGNATURE_C13
 		blob.insert(blob.end(), symbols_.begin(), symbols_.end());
 
-		// C13 subsection block: FILECHKSMS first (so per-line NameIndex
-		// references are valid forward into this subsection's payload),
-		// then any number of DEBUG_S_LINES subsections.
+		// C13 subsection order: DEBUG_S_LINES blocks first, then a single
+		// DEBUG_S_FILECHKSMS at the end.  Without DEBUG_S_FILECHKSMS the
+		// per-line NameIndex references can't resolve to file names.
+		// (mspdb also emits a DEBUG_S_STRINGTABLE between the two; we
+		// don't, and both llvm-pdbutil and dbghelp accept the simpler
+		// shape.)
+		blob.insert(blob.end(), linesSubs_.begin(), linesSubs_.end());
 		if (!checksums_.empty())
 		{
 			appendU32LE(blob, 0xF4);   // DEBUG_S_FILECHKSMS
 			appendU32LE(blob, static_cast<uint32_t>(checksums_.size()));
 			blob.insert(blob.end(), checksums_.begin(), checksums_.end());
 		}
-		blob.insert(blob.end(), linesSubs_.begin(), linesSubs_.end());
 
 		appendU32LE(blob, 0);   // GlobalRefCount
 		return blob;
@@ -2380,7 +2415,57 @@ public:
 		sourceInfo.insert(sourceInfo.end(), sourceNames.begin(), sourceNames.end());
 		padToAlign4(sourceInfo);
 		dbi.setSourceInfoSubstream(std::move(sourceInfo));
+		// Append each module's primary section-wide contribution to the
+		// global SectionContribs list AFTER the per-function entries are
+		// in place.  mspdb places it as the last entry; placing the
+		// section-wide entry at the front (or omitting it entirely)
+		// silently breaks dbghelp's address-to-module lookup for the
+		// per-function ranges and leaves cdb's `ln <module>!<symbol>`
+		// printing the function address without a source position.
+		for (ModuleStreamBuilder* m : mods_)
+			if (m->hasPrimaryContrib())
+				sectionContribs_.push_back(m->primaryContrib());
 		dbi.setSectionContribs(sectionContribs_);
+
+		// Build the DBI SectionMap substream from the PE section headers
+		// we kept aside.  Each header becomes one SectionMapEntry.
+		// mspdb emits exactly one entry per IMAGE_SECTION_HEADER and
+		// does NOT append an "absolute" terminator entry, despite some
+		// public docs that mention one; verified by reading the SecMap
+		// substream of a cv2pdb-mspdb-produced PDB byte-for-byte.
+		// Without this substream, dbghelp.dll cannot translate the
+		// segment-relative addresses inside S_GPROC32 records and
+		// DEBUG_S_LINES blocks into PE-section coordinates, and
+		// SymGetLineFromAddr64 silently returns no result; the cdb
+		// `ln <module>!<symbol>` and `bl` commands stop printing source
+		// file:line information without this substream.  mspdb uses
+		// flags = SD_SELECTOR | SD_32BIT | SD_READ | SD_EXECUTE = 0x10D
+		// for every section regardless of its actual characteristics;
+		// the value is "code-like" but dbghelp does not double-check it
+		// against IMAGE_SCN_*.  Match the same shape.
+		if (!sectionHeaders_.empty() && sectionHeaders_.size() % 40 == 0)
+		{
+			std::vector<uint8_t> secMap;
+			uint16_t numSections =
+			    static_cast<uint16_t>(sectionHeaders_.size() / 40);
+			appendU16LE(secMap, numSections);   // Count
+			appendU16LE(secMap, numSections);   // LogCount
+			for (uint16_t i = 0; i < numSections; i++)
+			{
+				const uint8_t* hdr = sectionHeaders_.data() + i * 40;
+				uint32_t virtualSize;
+				memcpy(&virtualSize, hdr + 8, 4);
+				appendU16LE(secMap, 0x010D);       // Flags
+				appendU16LE(secMap, 0);            // Ovl
+				appendU16LE(secMap, 0);            // Group
+				appendU16LE(secMap, i + 1);        // Frame (1-based)
+				appendU16LE(secMap, 0xFFFF);       // SectionName
+				appendU16LE(secMap, 0xFFFF);       // ClassName
+				appendU32LE(secMap, 0);            // Offset
+				appendU32LE(secMap, virtualSize);  // SectionLength
+			}
+			dbi.setSectionMapSubstream(std::move(secMap));
+		}
 
 		// Allocate stream indices for the GSI/PSI/SymbolRecords trio that
 		// the DBI header points at.  Modules occupy 8..7+N, then Globals,
